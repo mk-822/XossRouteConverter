@@ -19,6 +19,16 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(len(parts), 3)
         self.assertTrue(all(part.distance_m <= 50_000.01 for part in parts))
 
+    def test_map_projection_and_fit_zoom(self):
+        points = [converter.TrackPoint(35.0, 139.0), converter.TrackPoint(35.1, 139.2)]
+        first = converter.web_mercator_pixel(points[0], 10)
+        last = converter.web_mercator_pixel(points[1], 10)
+        self.assertLess(first[0], last[0])
+        self.assertLess(last[1], first[1])
+        zoom = converter.map_fit_zoom(points, 700, 600)
+        self.assertGreaterEqual(zoom, converter.MAP_MIN_ZOOM)
+        self.assertLessEqual(zoom, converter.MAP_MAX_ZOOM)
+
     def test_ro_output_has_xzroutes_header_and_valid_crc(self):
         _, points = converter.parse_gpx(REFERENCE / "Original" / "ムライチ.gpx")
         writer = converter.XossRouteWriter()

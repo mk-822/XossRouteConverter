@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import random
 import shutil
 import string
 import struct
 import tempfile
+import threading
 import time
 import tkinter as tk
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -17,10 +21,27 @@ import xml.etree.ElementTree as ET
 
 
 APP_DIR = Path(__file__).resolve().parent
+VERSION_PATH = APP_DIR / "VERSION"
 TEMPLATE_PATH = APP_DIR / "assets" / "xoss_nav_template.ro"
 DEFAULT_SPLIT_KM = 300.0
 EARTH_RADIUS_M = 6_378_137.0
 GPX_NS = "http://www.topografix.com/GPX/1/1"
+MAP_TILE_SIZE = 256
+MAP_MIN_ZOOM = 2
+MAP_MAX_ZOOM = 17
+MAP_CACHE_DIR = Path(tempfile.gettempdir()) / "xoss_route_converter_map_tiles"
+MAP_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+
+
+def read_app_version() -> str:
+    try:
+        version = VERSION_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        version = "dev"
+    return version or "dev"
+
+
+APP_VERSION = read_app_version()
 
 
 @dataclass
@@ -219,6 +240,31 @@ def sample_preserving_points(points: list[TrackPoint], count: int) -> list[Track
     return sample_by_fraction(points, fractions[:count])
 
 
+def web_mercator_pixel(point: TrackPoint, zoom: int) -> tuple[float, float]:
+    """Convert a GPS point to world-pixel coordinates for a slippy map."""
+    scale = MAP_TILE_SIZE * (2**zoom)
+    latitude = max(-85.05112878, min(85.05112878, point.lat))
+    x = (point.lon + 180.0) / 360.0 * scale
+    latitude_radians = math.radians(latitude)
+    y = (1.0 - math.asinh(math.tan(latitude_radians)) / math.pi) / 2.0 * scale
+    return x, y
+
+
+def map_fit_zoom(points: list[TrackPoint], width: int, height: int) -> int:
+    """Choose the closest zoom that keeps the complete route in the viewport."""
+    if not points or width <= 1 or height <= 1:
+        return MAP_MIN_ZOOM
+    padding_x = max(80, width * 0.12)
+    padding_y = max(100, height * 0.16)
+    for zoom in range(MAP_MAX_ZOOM, MAP_MIN_ZOOM - 1, -1):
+        projected = [web_mercator_pixel(point, zoom) for point in points]
+        route_width = max(x for x, _ in projected) - min(x for x, _ in projected)
+        route_height = max(y for _, y in projected) - min(y for _, y in projected)
+        if route_width <= width - padding_x and route_height <= height - padding_y:
+            return zoom
+    return MAP_MIN_ZOOM
+
+
 def crc16_modbus(data: bytes) -> int:
     crc = 0xFFFF
     for byte in data:
@@ -350,6 +396,229 @@ class XossRouteWriter:
             key=lambda i: (self.raw_points[i].lat - point.lat) ** 2 + (self.raw_points[i].lon - point.lon) ** 2,
         )
         return self.raw_fractions[best_index]
+
+
+class MapPreview(ttk.Frame):
+    """A lightweight OSM tile view with a GPX route drawn above it."""
+
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        toolbar = ttk.Frame(self)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        toolbar.columnconfigure(0, weight=1)
+        self.status_label = ttk.Label(toolbar, text="GPXを選択すると地図を表示します。", foreground="#555")
+        self.status_label.grid(row=0, column=0, sticky="w")
+        ttk.Button(toolbar, text="ルートに合わせる", command=self.fit_route).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(toolbar, text="−", width=3, command=lambda: self.change_zoom(-1)).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(toolbar, text="＋", width=3, command=lambda: self.change_zoom(1)).grid(row=0, column=3, padx=(3, 0))
+        ttk.Button(toolbar, text="地図を再取得", command=self.reload_tiles).grid(row=0, column=4, padx=(8, 0))
+        ttk.Label(toolbar, text="© OpenStreetMap contributors", foreground="#777").grid(row=0, column=5, padx=(12, 0))
+
+        self.canvas = tk.Canvas(self, background="#e8eef2", highlightthickness=0)
+        self.canvas.grid(row=1, column=0, sticky="nsew")
+        self.canvas.bind("<Configure>", self._on_resize)
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+
+        self.points: list[TrackPoint] = []
+        self.zoom = MAP_MIN_ZOOM
+        self.center_world = (0.0, 0.0)
+        self._fit_after_id: str | None = None
+        self._tile_requests: queue.Queue[tuple[int, int, int]] = queue.Queue()
+        self._tile_results: queue.Queue[tuple[tuple[int, int, int], bool]] = queue.Queue()
+        self._pending_tiles: set[tuple[int, int, int]] = set()
+        self._failed_tiles: set[tuple[int, int, int]] = set()
+        self._tile_images: dict[tuple[int, int, int], tk.PhotoImage] = {}
+        self._worker = threading.Thread(target=self._tile_worker, daemon=True)
+        self._worker.start()
+        self.after(100, self._poll_tile_results)
+
+    def set_route(self, points: list[TrackPoint]) -> None:
+        self.points = list(points)
+        self._failed_tiles.clear()
+        if not self.points:
+            self.center_world = (0.0, 0.0)
+            self.canvas.delete("all")
+            self.status_label.configure(text="GPXを選択すると地図を表示します。")
+            return
+        self.fit_route()
+
+    def fit_route(self) -> None:
+        if not self.points:
+            return
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        if width <= 2 or height <= 2:
+            if self._fit_after_id is None:
+                self._fit_after_id = self.after(100, self._fit_when_ready)
+            return
+        self._fit_after_id = None
+        self.zoom = map_fit_zoom(self.points, width, height)
+        projected = [web_mercator_pixel(point, self.zoom) for point in self.points]
+        self.center_world = (
+            (min(x for x, _ in projected) + max(x for x, _ in projected)) / 2.0,
+            (min(y for _, y in projected) + max(y for _, y in projected)) / 2.0,
+        )
+        self._render()
+
+    def _fit_when_ready(self) -> None:
+        self._fit_after_id = None
+        self.fit_route()
+
+    def change_zoom(self, delta: int) -> None:
+        if not self.points:
+            return
+        new_zoom = max(MAP_MIN_ZOOM, min(MAP_MAX_ZOOM, self.zoom + delta))
+        if new_zoom == self.zoom:
+            return
+        ratio = 2 ** (new_zoom - self.zoom)
+        self.center_world = (self.center_world[0] * ratio, self.center_world[1] * ratio)
+        self.zoom = new_zoom
+        self._render()
+
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        self.change_zoom(1 if event.delta > 0 else -1)
+
+    def _on_resize(self, _event: tk.Event) -> None:
+        if self.points:
+            self.fit_route()
+
+    def reload_tiles(self) -> None:
+        self._failed_tiles.clear()
+        self._render()
+
+    def _tile_path(self, zoom: int, tile_x: int, tile_y: int) -> Path:
+        return MAP_CACHE_DIR / str(zoom) / str(tile_x) / f"{tile_y}.png"
+
+    def _request_tile(self, key: tuple[int, int, int]) -> None:
+        if key in self._pending_tiles or key in self._failed_tiles:
+            return
+        self._pending_tiles.add(key)
+        self._tile_requests.put(key)
+
+    def _tile_worker(self) -> None:
+        while True:
+            zoom, tile_x, tile_y = self._tile_requests.get()
+            path = self._tile_path(zoom, tile_x, tile_y)
+            success = False
+            try:
+                MAP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                request = urllib.request.Request(
+                    MAP_TILE_URL.format(z=zoom, x=tile_x, y=tile_y),
+                    headers={"User-Agent": "XOSS-Route-Converter/1.0"},
+                )
+                with urllib.request.urlopen(request, timeout=8) as response:
+                    payload = response.read()
+                if payload.startswith(b"\x89PNG\r\n\x1a\n"):
+                    temporary = path.with_suffix(".tmp")
+                    temporary.write_bytes(payload)
+                    os.replace(temporary, path)
+                    success = True
+                else:
+                    raise ValueError("地図タイルの形式が不正です")
+            except (OSError, urllib.error.URLError, ValueError):
+                success = False
+            self._tile_results.put(((zoom, tile_x, tile_y), success))
+
+    def _poll_tile_results(self) -> None:
+        try:
+            while True:
+                key, success = self._tile_results.get_nowait()
+                self._pending_tiles.discard(key)
+                if success:
+                    self._failed_tiles.discard(key)
+                else:
+                    self._failed_tiles.add(key)
+                self._render()
+        except queue.Empty:
+            pass
+        try:
+            self.after(100, self._poll_tile_results)
+        except tk.TclError:
+            pass
+
+    def _render(self) -> None:
+        self.canvas.delete("all")
+        if not self.points:
+            self.status_label.configure(text="GPXを選択すると地図を表示します。")
+            return
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        if width <= 2 or height <= 2:
+            return
+
+        left = self.center_world[0] - width / 2.0
+        top = self.center_world[1] - height / 2.0
+        right = left + width
+        bottom = top + height
+        tile_count = 2**self.zoom
+        first_tile_x = math.floor(left / MAP_TILE_SIZE)
+        last_tile_x = math.floor((right - 1) / MAP_TILE_SIZE)
+        first_tile_y = max(0, math.floor(top / MAP_TILE_SIZE))
+        last_tile_y = min(tile_count - 1, math.floor((bottom - 1) / MAP_TILE_SIZE))
+        loading = 0
+
+        for tile_x in range(first_tile_x, last_tile_x + 1):
+            wrapped_x = tile_x % tile_count
+            for tile_y in range(first_tile_y, last_tile_y + 1):
+                key = (self.zoom, wrapped_x, tile_y)
+                image = self._tile_images.get(key)
+                path = self._tile_path(*key)
+                if image is None and path.is_file():
+                    try:
+                        image = tk.PhotoImage(file=str(path))
+                        self._tile_images[key] = image
+                    except tk.TclError:
+                        image = None
+                if image is not None:
+                    self.canvas.create_image(
+                        tile_x * MAP_TILE_SIZE - left,
+                        tile_y * MAP_TILE_SIZE - top,
+                        image=image,
+                        anchor="nw",
+                        tags="map_tile",
+                    )
+                else:
+                    self.canvas.create_rectangle(
+                        tile_x * MAP_TILE_SIZE - left,
+                        tile_y * MAP_TILE_SIZE - top,
+                        (tile_x + 1) * MAP_TILE_SIZE - left,
+                        (tile_y + 1) * MAP_TILE_SIZE - top,
+                        fill="#e8eef2",
+                        outline="#d4e0e6",
+                        tags="map_tile",
+                    )
+                    if key not in self._failed_tiles:
+                        self._request_tile(key)
+                    loading += 1
+
+        route = self.points if len(self.points) <= 4000 else sample_uniform(self.points, 4000)
+        projected = [
+            (web_mercator_pixel(point, self.zoom)[0] - left, web_mercator_pixel(point, self.zoom)[1] - top)
+            for point in route
+        ]
+        if len(projected) >= 2:
+            self.canvas.create_line(projected, fill="#ffffff", width=7, joinstyle="round", capstyle="round")
+            self.canvas.create_line(projected, fill="#d83b49", width=4, joinstyle="round", capstyle="round")
+        start_x, start_y = web_mercator_pixel(self.points[0], self.zoom)
+        end_x, end_y = web_mercator_pixel(self.points[-1], self.zoom)
+        self._draw_marker(start_x - left, start_y - top, "#2f9e62", "START")
+        self._draw_marker(end_x - left, end_y - top, "#c43d4b", "GOAL")
+
+        if self._failed_tiles:
+            self.status_label.configure(text="背景地図を取得できないため、ルート線のみ表示中")
+        elif loading:
+            self.status_label.configure(text=f"背景地図を読み込み中…（残り {loading} 枚）")
+        else:
+            self.status_label.configure(text=f"背景地図表示中 ／ ズーム {self.zoom}")
+
+    def _draw_marker(self, x: float, y: float, color: str, label: str) -> None:
+        radius = 7
+        self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius, fill=color, outline="white", width=2)
+        self.canvas.create_text(x + 12, y - 12, text=label, anchor="sw", fill=color, font=("Segoe UI", 9, "bold"))
 
 
 def make_rid(existing: set[int]) -> int:
@@ -526,9 +795,9 @@ def transfer_staging(staging: Path, device_root: Path, keep_existing: bool = Tru
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("XOSS NAV+ ルート転送ツール")
-        self.geometry("900x780")
-        self.minsize(800, 650)
+        self.title(f"XOSS NAV+ ルート転送ツール ({APP_VERSION})")
+        self.geometry("1400x820")
+        self.minsize(1100, 650)
         self.gpx_path: Path | None = None
         self.gpx_title = ""
         self.points: list[TrackPoint] = []
@@ -546,8 +815,23 @@ class App(tk.Tk):
             pass
         root = ttk.Frame(self, padding=16)
         root.pack(fill="both", expand=True)
-        root.columnconfigure(1, weight=1)
-        root.rowconfigure(4, weight=1)
+        root.columnconfigure(0, weight=0, minsize=500)
+        root.columnconfigure(1, weight=1, minsize=560)
+        root.rowconfigure(0, weight=1)
+
+        left_panel = ttk.Frame(root)
+        left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+        left_panel.columnconfigure(1, weight=1)
+        left_panel.rowconfigure(4, weight=1)
+
+        map_box = ttk.LabelFrame(root, text="ルート地図プレビュー", padding=10)
+        map_box.grid(row=0, column=1, sticky="nsew")
+        map_box.columnconfigure(0, weight=1)
+        map_box.rowconfigure(0, weight=1)
+        self.map_preview = MapPreview(map_box)
+        self.map_preview.grid(row=0, column=0, sticky="nsew")
+
+        root = left_panel
 
         ttk.Label(root, text="GPXファイル").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
         self.gpx_label = ttk.Label(root, text="未選択", foreground="#555")
@@ -643,6 +927,7 @@ class App(tk.Tk):
         self.gpx_path = Path(selected)
         self.gpx_label.configure(text=str(self.gpx_path))
         self.title_var.set(self.gpx_title)
+        self.map_preview.set_route(self.points)
         self.log(f"読込完了: {len(self.points):,}点、全長 {track_distance(self.points) / 1000:.1f}km")
         self.update_preview()
 
