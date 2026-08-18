@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import colorsys
 import json
 import math
 import os
@@ -32,6 +33,16 @@ MAP_MIN_ZOOM = 2
 MAP_MAX_ZOOM = 17
 MAP_CACHE_DIR = Path(tempfile.gettempdir()) / "xoss_route_converter_map_tiles"
 MAP_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+MAP_ROUTE_COLORS = (
+    "#d83b49",
+    "#2f6fed",
+    "#e08a00",
+    "#1b9e77",
+    "#8e5bd9",
+    "#c4528c",
+    "#008c95",
+    "#7a8b3e",
+)
 RID_MIN = 100000
 RID_MAX = 999999
 
@@ -247,6 +258,17 @@ def sample_preserving_points(points: list[TrackPoint], count: int) -> list[Track
     return sample_by_fraction(points, fractions[:count])
 
 
+def limit_route_points(points: list[TrackPoint], max_points: int | None) -> list[TrackPoint]:
+    """Optionally reduce a route to a requested maximum point count."""
+    if len(points) < 2:
+        raise ValueError("ルートには2点以上必要です。")
+    if max_points is None or max_points >= len(points):
+        return list(points)
+    if max_points < 2:
+        raise ValueError("間引き後の点数は2以上にしてください。")
+    return sample_preserving_points(points, max_points)
+
+
 def partition_track_points(points: list[TrackPoint], segment_count: int) -> list[list[TrackPoint]]:
     """Partition a route into contiguous segments, sharing boundary points."""
     if len(points) < 2:
@@ -294,6 +316,17 @@ def map_fit_zoom(points: list[TrackPoint], width: int, height: int) -> int:
         if route_width <= width - padding_x and route_height <= height - padding_y:
             return zoom
     return MAP_MIN_ZOOM
+
+
+def route_part_color(index: int, part_count: int) -> str:
+    """Return a stable, distinct color for a route part."""
+    if part_count <= 1:
+        return MAP_ROUTE_COLORS[0]
+    if part_count <= len(MAP_ROUTE_COLORS):
+        return MAP_ROUTE_COLORS[index % len(MAP_ROUTE_COLORS)]
+    hue = (index / part_count) % 1.0
+    red, green, blue = colorsys.hsv_to_rgb(hue, 0.78, 0.86)
+    return "#{:02x}{:02x}{:02x}".format(round(red * 255), round(green * 255), round(blue * 255))
 
 
 def zoomed_center(
@@ -367,14 +400,16 @@ class XossRouteWriter:
         minimum = max(1, math.ceil((point_count - 1) / 0xFFFE))
         return max(minimum, min(self.template_record_count, point_count - 1))
 
-    def create(self, points: list[TrackPoint], rid: int, name: str) -> bytes:
+    def create(
+        self,
+        points: list[TrackPoint],
+        rid: int,
+        name: str,
+        max_points: int | None = None,
+    ) -> bytes:
         if len(points) < 2:
             raise ValueError("ルートには2点以上必要です。")
-        # The device accepts variable-length RO files, but the available
-        # reference files show a much smaller practical point budget than a
-        # dense GPX track. Keep the full route shape while staying within the
-        # template's known-compatible elevation sample count.
-        route_points = sample_preserving_points(points, min(len(points), self.template_elev_count))
+        route_points = limit_route_points(points, max_points)
         point_count = len(route_points)
         record_count = self._record_count_for_points(point_count)
         segments = partition_track_points(route_points, record_count)
@@ -492,6 +527,7 @@ class MapPreview(ttk.Frame):
         self.canvas.bind("<ButtonRelease-1>", self._on_pan_end)
 
         self.points: list[TrackPoint] = []
+        self.route_parts: list[RoutePart] = []
         self.zoom = MAP_MIN_ZOOM
         self.center_world = (0.0, 0.0)
         self._pan_last: tuple[int, int] | None = None
@@ -506,14 +542,31 @@ class MapPreview(ttk.Frame):
         self.after(100, self._poll_tile_results)
 
     def set_route(self, points: list[TrackPoint]) -> None:
-        self.points = list(points)
+        if points:
+            self.set_route_parts([RoutePart(1, list(points), track_distance(points), elevation_gain(points))])
+        else:
+            self.set_route_parts([])
+
+    def set_route_parts(self, parts: list[RoutePart]) -> None:
+        """Set the route geometry and preserve each split part for colored drawing."""
+        previous_points = self.points
+        self.route_parts = [part for part in parts if len(part.points) >= 2]
+        self.points = []
+        for part in self.route_parts:
+            if self.points and self.points[-1] == part.points[0]:
+                self.points.extend(part.points[1:])
+            else:
+                self.points.extend(part.points)
         self._failed_tiles.clear()
         if not self.points:
             self.center_world = (0.0, 0.0)
             self.canvas.delete("all")
             self.status_label.configure(text="GPXを選択すると地図を表示します。")
             return
-        self.fit_route()
+        if previous_points:
+            self._render()
+        else:
+            self.fit_route()
 
     def fit_route(self) -> None:
         if not self.points:
@@ -697,14 +750,27 @@ class MapPreview(ttk.Frame):
                         self._request_tile(key)
                     loading += 1
 
-        route = self.points if len(self.points) <= 4000 else sample_uniform(self.points, 4000)
-        projected = [
-            (web_mercator_pixel(point, self.zoom)[0] - left, web_mercator_pixel(point, self.zoom)[1] - top)
-            for point in route
-        ]
-        if len(projected) >= 2:
-            self.canvas.create_line(projected, fill="#ffffff", width=7, joinstyle="round", capstyle="round")
-            self.canvas.create_line(projected, fill="#d83b49", width=4, joinstyle="round", capstyle="round")
+        route_parts = self.route_parts or [RoutePart(1, self.points, track_distance(self.points), elevation_gain(self.points))]
+        total_route_points = sum(len(part.points) for part in route_parts)
+        for part_index, part in enumerate(route_parts):
+            sample_count = min(
+                len(part.points),
+                max(2, round(4000 * len(part.points) / total_route_points)),
+            )
+            route = part.points if len(part.points) <= sample_count else sample_uniform(part.points, sample_count)
+            projected = [
+                (web_mercator_pixel(point, self.zoom)[0] - left, web_mercator_pixel(point, self.zoom)[1] - top)
+                for point in route
+            ]
+            if len(projected) >= 2:
+                self.canvas.create_line(projected, fill="#ffffff", width=7, joinstyle="round", capstyle="round")
+                self.canvas.create_line(
+                    projected,
+                    fill=route_part_color(part_index, len(route_parts)),
+                    width=4,
+                    joinstyle="round",
+                    capstyle="round",
+                )
         start_x, start_y = web_mercator_pixel(self.points[0], self.zoom)
         end_x, end_y = web_mercator_pixel(self.points[-1], self.zoom)
         self._draw_marker(start_x - left, start_y - top, "#2f9e62", "START")
@@ -808,25 +874,8 @@ def write_routebooks_atomic(path: Path, document: dict) -> None:
     os.replace(temporary, path)
 
 
-def create_device_backup(device_root: Path, route_ids: list[str]) -> Path:
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    backup = device_root / f"XOSS_Backup_{stamp}"
-    suffix = 2
-    while backup.exists():
-        backup = device_root / f"XOSS_Backup_{stamp}_{suffix}"
-        suffix += 1
-    backup_routes = backup / "Routes"
-    backup_routes.mkdir(parents=True)
-    shutil.copy2(device_root / "routebooks.json", backup / "routebooks.json")
-    for rid in route_ids:
-        route_file = device_root / "Routes" / f"{rid}.ro"
-        if route_file.is_file():
-            shutil.copy2(route_file, backup_routes / route_file.name)
-    return backup
-
-
-def delete_routes_from_device(device_root: Path, route_ids: list[str]) -> Path:
-    """Back up and remove selected route files and their routebook entries."""
+def delete_routes_from_device(device_root: Path, route_ids: list[str]) -> None:
+    """Remove selected route files and their routebook entries without creating a backup."""
     routebooks_path = device_root / "routebooks.json"
     document = read_routebooks(routebooks_path)
     requested_ids = list(dict.fromkeys(str(rid) for rid in route_ids))
@@ -834,25 +883,23 @@ def delete_routes_from_device(device_root: Path, route_ids: list[str]) -> Path:
     target_ids = [rid for rid in requested_ids if rid in existing_ids]
     if not target_ids:
         raise ValueError("選択したルートはすでに端末から削除されています。")
-    backup = create_device_backup(device_root, target_ids)
     route_files = [device_root / "Routes" / f"{rid}.ro" for rid in target_ids]
-    removed_files: list[Path] = []
+    route_contents: dict[Path, bytes] = {}
+    for route_file in route_files:
+        if route_file.is_file():
+            route_contents[route_file] = route_file.read_bytes()
     try:
         for route_file in route_files:
             if route_file.is_file():
                 route_file.unlink()
-                removed_files.append(route_file)
         target_id_set = set(target_ids)
         document["routes"] = [route for route in document.get("routes", []) if str(route.get("rid", "")) not in target_id_set]
         document["update_at"] = int(time.time())
         write_routebooks_atomic(routebooks_path, document)
     except Exception:
-        for route_file in removed_files:
-            backup_file = backup / "Routes" / route_file.name
-            if backup_file.is_file():
-                shutil.copy2(backup_file, route_file)
+        for route_file, contents in route_contents.items():
+            route_file.write_bytes(contents)
         raise
-    return backup
 
 
 def find_xoss_drives() -> list[Path]:
@@ -878,6 +925,7 @@ def stage_routes(
     parts: list[RoutePart],
     title: str,
     template_path: Path = TEMPLATE_PATH,
+    max_points: int | None = None,
 ) -> tuple[Path, dict, list[Path]]:
     writer = XossRouteWriter(template_path)
     staging = Path(tempfile.mkdtemp(prefix="xoss_route_converter_"))
@@ -891,7 +939,7 @@ def stage_routes(
     for part, rid in zip(parts, rids):
         existing.add(rid)
         part_name = route_part_name(title, part.number, len(parts))
-        payload = writer.create(part.points, rid, part_name)
+        payload = writer.create(part.points, rid, part_name, max_points=max_points)
         output = routes_dir / f"{rid}.ro"
         output.write_bytes(payload)
         generated.append(output)
@@ -923,8 +971,6 @@ def transfer_staging(staging: Path, device_root: Path, keep_existing: bool = Tru
         shutil.copy2(source, device_routes / source.name)
 
     destination_json = device_root / "routebooks.json"
-    backup = device_root / f"routebooks.json.bak_{time.strftime('%Y%m%d_%H%M%S')}"
-    shutil.copy2(destination_json, backup)
     if keep_existing:
         current = read_routebooks(destination_json)
         incoming = read_routebooks(staging / "routebooks.json")
@@ -967,7 +1013,7 @@ class App(tk.Tk):
         left_panel = ttk.Frame(root)
         left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
         left_panel.columnconfigure(1, weight=1)
-        left_panel.rowconfigure(4, weight=1)
+        left_panel.rowconfigure(5, weight=1)
 
         map_box = ttk.LabelFrame(root, text="ルート地図プレビュー", padding=10)
         map_box.grid(row=0, column=1, sticky="nsew")
@@ -1004,15 +1050,23 @@ class App(tk.Tk):
         ttk.Label(split_options, text="km（上限距離）").pack(side="left")
         self.split_var.trace_add("write", lambda *_: self.update_preview())
 
-        ttk.Label(root, text="転送先").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=5)
+        ttk.Label(root, text="点数による間引き").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=5)
+        self.point_limit_var = tk.StringVar()
+        point_options = ttk.Frame(root)
+        point_options.grid(row=3, column=1, columnspan=2, sticky="w", pady=5)
+        ttk.Entry(point_options, textvariable=self.point_limit_var, width=12).pack(side="left")
+        ttk.Label(point_options, text="点（空欄＝間引きなし、出力点数上限）").pack(side="left", padx=(6, 0))
+        self.point_limit_var.trace_add("write", lambda *_: self.update_preview())
+
+        ttk.Label(root, text="転送先").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=5)
         self.drive_var = tk.StringVar()
         self.drive_combo = ttk.Combobox(root, textvariable=self.drive_var, state="readonly")
-        self.drive_combo.grid(row=3, column=1, sticky="ew", pady=5)
+        self.drive_combo.grid(row=4, column=1, sticky="ew", pady=5)
         self.drive_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_device_routes())
-        ttk.Button(root, text="再検索", command=self.refresh_drives).grid(row=3, column=2, padx=(10, 0), pady=5)
+        ttk.Button(root, text="再検索", command=self.refresh_drives).grid(row=4, column=2, padx=(10, 0), pady=5)
 
         preview_box = ttk.LabelFrame(root, text="分割プレビュー", padding=10)
-        preview_box.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=(14, 10))
+        preview_box.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=(14, 10))
         preview_box.columnconfigure(0, weight=1)
         preview_box.rowconfigure(1, weight=1)
         self.summary_label = ttk.Label(preview_box, text="GPXを選択すると距離と分割数を表示します。")
@@ -1030,13 +1084,13 @@ class App(tk.Tk):
         scroll.grid(row=1, column=1, sticky="ns")
 
         options = ttk.Frame(root)
-        options.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        options.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 8))
         ttk.Button(options, text="変換してフォルダへ保存…", command=self.save_routes).pack(side="right", padx=(8, 0))
         self.transfer_button = ttk.Button(options, text="XOSS NAV+へ転送", command=self.transfer_routes)
         self.transfer_button.pack(side="right")
 
         device_box = ttk.LabelFrame(root, text="端末内ルート管理", padding=10)
-        device_box.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        device_box.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(0, 10))
         device_box.columnconfigure(0, weight=1)
         device_box.rowconfigure(0, weight=1)
         device_columns = ("rid", "name", "distance", "size")
@@ -1058,7 +1112,7 @@ class App(tk.Tk):
         ttk.Button(device_actions, text="選択したルートを削除", command=self.delete_device_routes).pack(side="right")
 
         self.status = tk.Text(root, height=5, state="disabled", wrap="word", background="#f5f5f5")
-        self.status.grid(row=7, column=0, columnspan=3, sticky="ew")
+        self.status.grid(row=8, column=0, columnspan=3, sticky="ew")
         self.log("GPXファイルを選択してください。")
 
     def log(self, message: str) -> None:
@@ -1090,20 +1144,44 @@ class App(tk.Tk):
         self.split_entry.configure(state="normal" if self.split_enabled_var.get() else "disabled")
         self.update_preview()
 
+    def _get_point_limit(self) -> int | None:
+        value = self.point_limit_var.get().strip().replace(",", "")
+        if not value:
+            return None
+        try:
+            limit = int(value)
+        except ValueError as exc:
+            raise ValueError("間引き後の点数を整数で入力してください。") from exc
+        if limit < 2:
+            raise ValueError("間引き後の点数は2以上にしてください。")
+        return limit
+
     def update_preview(self) -> None:
         for item in self.tree.get_children():
             self.tree.delete(item)
         if not self.points:
             return
+        try:
+            max_points = self._get_point_limit()
+        except ValueError as exc:
+            self.summary_label.configure(text=str(exc))
+            self.parts = []
+            return
+
+        def output_point_count(part: RoutePart) -> int:
+            return min(len(part.points), max_points) if max_points is not None else len(part.points)
+
         if not self.split_enabled_var.get():
             self.parts = split_track(self.points, None)
+            self.map_preview.set_route_parts(self.parts)
             total = track_distance(self.points)
-            self.summary_label.configure(text=f"全長 {total / 1000:.2f}km ／ 分割なし（1ルート）")
+            point_text = f" ／ 出力点数 {output_point_count(self.parts[0]):,}点"
+            self.summary_label.configure(text=f"全長 {total / 1000:.2f}km ／ 分割なし（1ルート）{point_text}")
             part = self.parts[0]
             self.tree.insert(
                 "",
                 "end",
-                values=(part.number, f"{part.distance_m / 1000:.2f} km", f"{len(part.points):,}", f"{part.gain_m:,} m"),
+                values=(part.number, f"{part.distance_m / 1000:.2f} km", f"{output_point_count(part):,}", f"{part.gain_m:,} m"),
             )
             return
         try:
@@ -1115,12 +1193,14 @@ class App(tk.Tk):
             self.summary_label.configure(text="分割距離を正の数値で入力してください。")
             self.parts = []
             return
+        self.map_preview.set_route_parts(self.parts)
         total = track_distance(self.points)
+        point_limit_text = f" ／ 出力点数上限 {max_points:,}点" if max_points is not None else " ／ 間引きなし"
         self.summary_label.configure(
-            text=f"全長 {total / 1000:.2f}km ／ {len(self.parts)}ルートに分割（上限 {max_km:g}km）"
+            text=f"全長 {total / 1000:.2f}km ／ {len(self.parts)}ルートに分割（上限 {max_km:g}km）{point_limit_text}"
         )
         for part in self.parts:
-            self.tree.insert("", "end", values=(part.number, f"{part.distance_m / 1000:.2f} km", f"{len(part.points):,}", f"{part.gain_m:,} m"))
+            self.tree.insert("", "end", values=(part.number, f"{part.distance_m / 1000:.2f} km", f"{output_point_count(part):,}", f"{part.gain_m:,} m"))
 
     def refresh_drives(self) -> None:
         self.drives = find_xoss_drives()
@@ -1181,27 +1261,27 @@ class App(tk.Tk):
         preview = "\n".join(f"・{name} (RID {rid})" for rid, name in zip(route_ids, route_names))
         if not messagebox.askyesno(
             "ルート削除の確認",
-            f"次の{len(route_ids)}件を端末から削除します。\n\n{preview}\n\n削除前にバックアップを作成します。続行しますか？",
+            f"次の{len(route_ids)}件を端末から削除します。\n\n{preview}\n\n削除後は元に戻せません。続行しますか？",
         ):
             return
         try:
-            backup = delete_routes_from_device(drive, route_ids)
+            delete_routes_from_device(drive, route_ids)
         except (OSError, ValueError) as exc:
             messagebox.showerror("削除エラー", str(exc))
             self.refresh_device_routes()
             return
         self.refresh_device_routes()
-        self.log(f"端末から{len(route_ids)}件を削除しました。バックアップ: {backup}")
+        self.log(f"端末から{len(route_ids)}件を削除しました。")
 
     def make_staging(self) -> Path:
         if not self.parts:
-            raise ValueError("GPXと分割距離を確認してください。")
+            raise ValueError("GPX、分割距離、間引き設定を確認してください。")
         title = self.title_var.get().strip()
         if not title:
             raise ValueError("ルート名を入力してください。")
         if self.staging and self.staging.exists():
             shutil.rmtree(self.staging, ignore_errors=True)
-        self.staging, _, generated = stage_routes(self.parts, title)
+        self.staging, _, generated = stage_routes(self.parts, title, max_points=self._get_point_limit())
         self.log(f"変換完了: {len(generated)}件のROファイルを作成しました。")
         return self.staging
 
@@ -1241,7 +1321,7 @@ class App(tk.Tk):
             messagebox.showerror("転送エラー", str(exc))
             return
         self.refresh_device_routes()
-        self.log(f"転送完了: {drive}（既存routebooks.jsonのバックアップも作成）")
+        self.log(f"転送完了: {drive}")
         messagebox.showinfo("転送完了", "転送が完了しました。NAV+を安全に取り外して、Routebookから選択してください。")
 
 

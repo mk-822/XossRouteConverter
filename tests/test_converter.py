@@ -29,6 +29,11 @@ class ConverterTests(unittest.TestCase):
         self.assertGreaterEqual(zoom, converter.MAP_MIN_ZOOM)
         self.assertLessEqual(zoom, converter.MAP_MAX_ZOOM)
 
+    def test_route_part_colors_are_distinct_for_split_preview(self):
+        colors = [converter.route_part_color(index, 3) for index in range(3)]
+        self.assertEqual(len(set(colors)), 3)
+        self.assertEqual(converter.route_part_color(0, 1), converter.MAP_ROUTE_COLORS[0])
+
     def test_zoomed_center_keeps_cursor_position_fixed(self):
         center = (1_000.0, 800.0)
         width, height = 800.0, 600.0
@@ -81,6 +86,7 @@ class ConverterTests(unittest.TestCase):
 
             elev_data_offset = int.from_bytes(payload[0x18:0x1C], "little")
             elev_count = int.from_bytes(payload[0x1C:0x20], "little")
+            self.assertEqual(elev_count, len(points))
             self.assertEqual(payload[elev_data_offset - 12 : elev_data_offset - 8], b"ELEV")
             self.assertEqual(len(payload) - 2 - elev_data_offset, elev_count * 8)
             self.assertEqual(int.from_bytes(payload[-2:], "little"), converter.crc16_modbus(payload[:-2]))
@@ -88,7 +94,15 @@ class ConverterTests(unittest.TestCase):
         _, short_points = converter.parse_gpx(REFERENCE / "Original" / "倶知安to登別.gpx")
         compact_payload = writer.create(short_points[:100], 654321, "短いテスト")
         self.assertLess(len(compact_payload), len(payloads[1]))
-        self.assertLessEqual(int.from_bytes(payloads[1][0x1C:0x20], "little"), writer.template_elev_count)
+
+    def test_ro_output_can_be_thinned_to_requested_point_count(self):
+        _, points = converter.parse_gpx(REFERENCE / "Original" / "倶知安to登別.gpx")
+        writer = converter.XossRouteWriter()
+        payload = writer.create(points, 654321, "間引きテスト", max_points=321)
+        full_payload = writer.create(points, 654321, "全点")
+        self.assertEqual(int.from_bytes(payload[0x1C:0x20], "little"), 321)
+        self.assertLess(len(payload), len(full_payload))
+        self.assertEqual(int.from_bytes(payload[-2:], "little"), converter.crc16_modbus(payload[:-2]))
 
     def test_split_track_can_be_disabled(self):
         _, points = converter.parse_gpx(REFERENCE / "Original" / "倶知安to登別.gpx")
@@ -117,6 +131,18 @@ class ConverterTests(unittest.TestCase):
             self.assertEqual(entries[-1]["size"], files[0].stat().st_size)
             self.assertEqual(json.loads((staging / "routebooks.json").read_text(encoding="utf-8"))["routes"][-1]["rid"], entries[-1]["rid"])
 
+    def test_transfer_does_not_create_routebooks_backup(self):
+        _, points = converter.parse_gpx(REFERENCE / "Original" / "倶知安to登別.gpx")
+        parts = converter.split_track(points[:2], None)
+        with tempfile.TemporaryDirectory() as temp:
+            device = Path(temp)
+            shutil = __import__("shutil")
+            shutil.copy2(REFERENCE / "routebooks.json", device / "routebooks.json")
+            staging, _, _ = converter.stage_routes(parts, "転送テスト")
+            self.addCleanup(lambda: shutil.rmtree(staging, ignore_errors=True))
+            converter.transfer_staging(staging, device)
+            self.assertFalse(any(device.glob("routebooks.json.bak_*")))
+
     def test_split_route_rids_are_consecutive_and_names_are_numbered(self):
         _, points = converter.parse_gpx(REFERENCE / "Original" / "倶知安to登別.gpx")
         parts = converter.split_track(points, 30_000)
@@ -134,7 +160,7 @@ class ConverterTests(unittest.TestCase):
         self.assertTrue(all(len(name.encode("utf-8")) <= 31 for name in expected_names))
         self.assertEqual(len(files), len(parts))
 
-    def test_delete_device_route_creates_backup_and_removes_ro(self):
+    def test_delete_device_route_removes_ro_without_backup(self):
         with tempfile.TemporaryDirectory() as temp:
             device = Path(temp)
             shutil = __import__("shutil")
@@ -142,12 +168,12 @@ class ConverterTests(unittest.TestCase):
             routes = device / "Routes"
             routes.mkdir()
             shutil.copy2(REFERENCE / "Routes" / "253228.ro", routes / "253228.ro")
-            backup = converter.delete_routes_from_device(device, ["253228"])
+            result = converter.delete_routes_from_device(device, ["253228"])
             document = json.loads((device / "routebooks.json").read_text(encoding="utf-8"))
             self.assertNotIn(253228, [item["rid"] for item in document["routes"]])
             self.assertFalse((routes / "253228.ro").exists())
-            self.assertTrue((backup / "routebooks.json").exists())
-            self.assertTrue((backup / "Routes" / "253228.ro").exists())
+            self.assertIsNone(result)
+            self.assertFalse(any(device.glob("XOSS_Backup_*")))
 
 
 if __name__ == "__main__":
