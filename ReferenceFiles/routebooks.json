@@ -1,0 +1,43 @@
+{
+	"version":	"2.0.0",
+	"device_model":	"A2",
+	"sn":	"01652264",
+	"update_at":	1787006894,
+	"routes":	[{
+			"rid":	253228,
+			"size":	14886,
+			"source":	1,
+			"name":	"ムライチ",
+			"type":	"Cycling",
+			"verison":	"2",
+			"length":	35575,
+			"gain":	87
+		}, {
+			"rid":	118011,
+			"size":	13666,
+			"source":	1,
+			"name":	"寿都 復路",
+			"type":	"Cycling",
+			"verison":	"2",
+			"length":	128686,
+			"gain":	2045
+		}, {
+			"rid":	118010,
+			"size":	16014,
+			"source":	1,
+			"name":	"黒松内・寿都温泉 往路",
+			"type":	"Cycling",
+			"verison":	"2",
+			"length":	148000,
+			"gain":	1990
+		}, {
+			"rid":	112444,
+			"size":	18434,
+			"source":	1,
+			"name":	"倶知安to登別",
+			"type":	"Cycling",
+			"verison":	"2",
+			"length":	104128,
+			"gain":	1974
+		}]
+}
