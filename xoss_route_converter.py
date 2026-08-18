@@ -26,6 +26,9 @@ APP_DIR = Path(__file__).resolve().parent
 VERSION_PATH = APP_DIR / "VERSION"
 TEMPLATE_PATH = APP_DIR / "assets" / "xoss_nav_template.ro"
 DEFAULT_SPLIT_KM = 300.0
+MIN_OUTPUT_POINTS = 1_000
+MAX_OUTPUT_POINTS = 24_000
+DEFAULT_OUTPUT_POINTS = 15_000
 EARTH_RADIUS_M = 6_378_137.0
 GPX_NS = "http://www.topografix.com/GPX/1/1"
 MAP_TILE_SIZE = 256
@@ -258,14 +261,14 @@ def sample_preserving_points(points: list[TrackPoint], count: int) -> list[Track
     return sample_by_fraction(points, fractions[:count])
 
 
-def limit_route_points(points: list[TrackPoint], max_points: int | None) -> list[TrackPoint]:
-    """Optionally reduce a route to a requested maximum point count."""
+def limit_route_points(points: list[TrackPoint], max_points: int) -> list[TrackPoint]:
+    """Reduce a route to the requested maximum point count when necessary."""
     if len(points) < 2:
         raise ValueError("ルートには2点以上必要です。")
-    if max_points is None or max_points >= len(points):
+    if not MIN_OUTPUT_POINTS <= max_points <= MAX_OUTPUT_POINTS:
+        raise ValueError(f"間引き後の点数は{MIN_OUTPUT_POINTS:,}～{MAX_OUTPUT_POINTS:,}の範囲で指定してください。")
+    if max_points >= len(points):
         return list(points)
-    if max_points < 2:
-        raise ValueError("間引き後の点数は2以上にしてください。")
     return sample_preserving_points(points, max_points)
 
 
@@ -405,7 +408,7 @@ class XossRouteWriter:
         points: list[TrackPoint],
         rid: int,
         name: str,
-        max_points: int | None = None,
+        max_points: int = DEFAULT_OUTPUT_POINTS,
     ) -> bytes:
         if len(points) < 2:
             raise ValueError("ルートには2点以上必要です。")
@@ -925,7 +928,7 @@ def stage_routes(
     parts: list[RoutePart],
     title: str,
     template_path: Path = TEMPLATE_PATH,
-    max_points: int | None = None,
+    max_points: int = DEFAULT_OUTPUT_POINTS,
 ) -> tuple[Path, dict, list[Path]]:
     writer = XossRouteWriter(template_path)
     staging = Path(tempfile.mkdtemp(prefix="xoss_route_converter_"))
@@ -1051,11 +1054,14 @@ class App(tk.Tk):
         self.split_var.trace_add("write", lambda *_: self.update_preview())
 
         ttk.Label(root, text="点数による間引き").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=5)
-        self.point_limit_var = tk.StringVar()
+        self.point_limit_var = tk.StringVar(value=str(DEFAULT_OUTPUT_POINTS))
         point_options = ttk.Frame(root)
         point_options.grid(row=3, column=1, columnspan=2, sticky="w", pady=5)
         ttk.Entry(point_options, textvariable=self.point_limit_var, width=12).pack(side="left")
-        ttk.Label(point_options, text="点（空欄＝間引きなし、出力点数上限）").pack(side="left", padx=(6, 0))
+        ttk.Label(
+            point_options,
+            text=f"点（{MIN_OUTPUT_POINTS:,}～{MAX_OUTPUT_POINTS:,}、元の点数が少なければそのまま）",
+        ).pack(side="left", padx=(6, 0))
         self.point_limit_var.trace_add("write", lambda *_: self.update_preview())
 
         ttk.Label(root, text="転送先").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=5)
@@ -1144,16 +1150,16 @@ class App(tk.Tk):
         self.split_entry.configure(state="normal" if self.split_enabled_var.get() else "disabled")
         self.update_preview()
 
-    def _get_point_limit(self) -> int | None:
+    def _get_point_limit(self) -> int:
         value = self.point_limit_var.get().strip().replace(",", "")
         if not value:
-            return None
+            raise ValueError(f"間引き後の点数を{MIN_OUTPUT_POINTS:,}～{MAX_OUTPUT_POINTS:,}で入力してください。")
         try:
             limit = int(value)
         except ValueError as exc:
             raise ValueError("間引き後の点数を整数で入力してください。") from exc
-        if limit < 2:
-            raise ValueError("間引き後の点数は2以上にしてください。")
+        if not MIN_OUTPUT_POINTS <= limit <= MAX_OUTPUT_POINTS:
+            raise ValueError(f"間引き後の点数は{MIN_OUTPUT_POINTS:,}～{MAX_OUTPUT_POINTS:,}の範囲で指定してください。")
         return limit
 
     def update_preview(self) -> None:
@@ -1169,7 +1175,7 @@ class App(tk.Tk):
             return
 
         def output_point_count(part: RoutePart) -> int:
-            return min(len(part.points), max_points) if max_points is not None else len(part.points)
+            return min(len(part.points), max_points)
 
         if not self.split_enabled_var.get():
             self.parts = split_track(self.points, None)
@@ -1195,7 +1201,7 @@ class App(tk.Tk):
             return
         self.map_preview.set_route_parts(self.parts)
         total = track_distance(self.points)
-        point_limit_text = f" ／ 出力点数上限 {max_points:,}点" if max_points is not None else " ／ 間引きなし"
+        point_limit_text = f" ／ 出力点数上限 {max_points:,}点"
         self.summary_label.configure(
             text=f"全長 {total / 1000:.2f}km ／ {len(self.parts)}ルートに分割（上限 {max_km:g}km）{point_limit_text}"
         )

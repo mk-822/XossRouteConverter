@@ -98,11 +98,19 @@ class ConverterTests(unittest.TestCase):
     def test_ro_output_can_be_thinned_to_requested_point_count(self):
         _, points = converter.parse_gpx(REFERENCE / "Original" / "倶知安to登別.gpx")
         writer = converter.XossRouteWriter()
-        payload = writer.create(points, 654321, "間引きテスト", max_points=321)
+        payload = writer.create(points, 654321, "間引きテスト", max_points=1_000)
         full_payload = writer.create(points, 654321, "全点")
-        self.assertEqual(int.from_bytes(payload[0x1C:0x20], "little"), 321)
+        self.assertEqual(int.from_bytes(payload[0x1C:0x20], "little"), 1_000)
         self.assertLess(len(payload), len(full_payload))
         self.assertEqual(int.from_bytes(payload[-2:], "little"), converter.crc16_modbus(payload[:-2]))
+
+    def test_output_point_limit_accepts_only_configured_range(self):
+        _, points = converter.parse_gpx(REFERENCE / "Original" / "倶知安to登別.gpx")
+        self.assertEqual(len(converter.limit_route_points(points, 24_000)), len(points))
+        with self.assertRaises(ValueError):
+            converter.limit_route_points(points, 999)
+        with self.assertRaises(ValueError):
+            converter.limit_route_points(points, 24_001)
 
     def test_split_track_can_be_disabled(self):
         _, points = converter.parse_gpx(REFERENCE / "Original" / "倶知安to登別.gpx")
