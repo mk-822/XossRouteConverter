@@ -14,6 +14,7 @@ import time
 import tkinter as tk
 import urllib.error
 import urllib.request
+from bisect import bisect_left
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -31,6 +32,8 @@ MAP_MIN_ZOOM = 2
 MAP_MAX_ZOOM = 17
 MAP_CACHE_DIR = Path(tempfile.gettempdir()) / "xoss_route_converter_map_tiles"
 MAP_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+RID_MIN = 100000
+RID_MAX = 999999
 
 
 def read_app_version() -> str:
@@ -129,7 +132,11 @@ def parse_gpx(path: Path) -> tuple[str, list[TrackPoint]]:
     return title, points
 
 
-def split_track(points: list[TrackPoint], max_distance_m: float) -> list[RoutePart]:
+def split_track(points: list[TrackPoint], max_distance_m: float | None) -> list[RoutePart]:
+    if len(points) < 2:
+        raise ValueError("ルートには2点以上必要です。")
+    if max_distance_m is None:
+        return [RoutePart(1, list(points), track_distance(points), elevation_gain(points))]
     if max_distance_m <= 0:
         raise ValueError("分割距離は0より大きくしてください。")
 
@@ -240,6 +247,30 @@ def sample_preserving_points(points: list[TrackPoint], count: int) -> list[Track
     return sample_by_fraction(points, fractions[:count])
 
 
+def partition_track_points(points: list[TrackPoint], segment_count: int) -> list[list[TrackPoint]]:
+    """Partition a route into contiguous segments, sharing boundary points."""
+    if len(points) < 2:
+        raise ValueError("ルートには2点以上必要です。")
+    segment_count = max(1, min(segment_count, len(points) - 1))
+    if segment_count == 1:
+        return [list(points)]
+
+    fractions = point_distance_fractions(points)
+    boundaries = [0]
+    for segment_index in range(1, segment_count):
+        target = segment_index / segment_count
+        minimum = boundaries[-1] + 1
+        maximum = len(points) - 1 - (segment_count - segment_index)
+        candidate = min(maximum, bisect_left(fractions, target, minimum, maximum + 1))
+        candidates = [candidate]
+        if candidate > minimum:
+            candidates.append(candidate - 1)
+        candidate = min(candidates, key=lambda index: abs(fractions[index] - target))
+        boundaries.append(candidate)
+    boundaries.append(len(points) - 1)
+    return [points[start : end + 1] for start, end in zip(boundaries, boundaries[1:])]
+
+
 def web_mercator_pixel(point: TrackPoint, zoom: int) -> tuple[float, float]:
     """Convert a GPS point to world-pixel coordinates for a slippy map."""
     scale = MAP_TILE_SIZE * (2**zoom)
@@ -265,6 +296,29 @@ def map_fit_zoom(points: list[TrackPoint], width: int, height: int) -> int:
     return MAP_MIN_ZOOM
 
 
+def zoomed_center(
+    center_world: tuple[float, float],
+    old_zoom: int,
+    new_zoom: int,
+    width: float,
+    height: float,
+    focus_x: float | None = None,
+    focus_y: float | None = None,
+) -> tuple[float, float]:
+    """Return the new world center while keeping a viewport point fixed."""
+    if focus_x is None:
+        focus_x = width / 2.0
+    if focus_y is None:
+        focus_y = height / 2.0
+    offset_x = focus_x - width / 2.0
+    offset_y = focus_y - height / 2.0
+    ratio = 2 ** (new_zoom - old_zoom)
+    return (
+        (center_world[0] + offset_x) * ratio - offset_x,
+        (center_world[1] + offset_y) * ratio - offset_y,
+    )
+
+
 def crc16_modbus(data: bytes) -> int:
     crc = 0xFFFF
     for byte in data:
@@ -275,7 +329,7 @@ def crc16_modbus(data: bytes) -> int:
 
 
 class XossRouteWriter:
-    """Creates XZRoutes v2 files using the supplied NAV+ reference file as a schema template."""
+    """Creates variable-length XZRoutes v2 files from the supplied schema template."""
 
     def __init__(self, template_path: Path = TEMPLATE_PATH):
         if not template_path.is_file():
@@ -286,40 +340,91 @@ class XossRouteWriter:
         self.template = template_path.read_bytes()
         if not self.template.startswith(b"XZRoutes"):
             raise ValueError("参照テンプレートがXZRoutes形式ではありません。")
-        self.elev_offset = self.template.index(b"ELEV")
-        self.raw_start = 0x480
-        self.raw_end = self._find_raw_end()
-        if self.raw_start >= self.raw_end or (self.raw_end - self.raw_start) % 8:
-            raise ValueError("参照テンプレートの経路点ブロックを解析できません。")
-        self.raw_points = [
-            TrackPoint(lat / 1_000_000.0, lon / 1_000_000.0)
-            for lat, lon in struct.iter_unpack("<ii", self.template[self.raw_start : self.raw_end])
-        ]
-        self.raw_fractions = point_distance_fractions(self.raw_points)
-        self.elev_count = struct.unpack_from("<I", self.template, self.elev_offset + 4)[0]
-        if self.elev_count <= 0:
+        self.header_size = 0x60
+        self.record_size = 44
+        self.template_record_count = struct.unpack_from("<H", self.template, 0x16)[0]
+        if self.template_record_count <= 0:
+            raise ValueError("参照テンプレートの区間レコード数が不正です。")
+        template_point_start = self.header_size + self.record_size * self.template_record_count
+        template_point_end = struct.unpack_from("<I", self.template, 0x30)[0]
+        self.elev_marker_offset = self.template.index(b"ELEV")
+        if not template_point_start < template_point_end < self.elev_marker_offset:
+            raise ValueError("参照テンプレートの座標列位置を解析できません。")
+        if (template_point_end - template_point_start) % 8:
+            raise ValueError("参照テンプレートの座標列サイズが不正です。")
+        self.elev_gap = self.elev_marker_offset - template_point_end
+        self.template_elev_count = struct.unpack_from("<I", self.template, self.elev_marker_offset + 4)[0]
+        if self.template_elev_count <= 0:
             raise ValueError("参照テンプレートのELEV件数が不正です。")
-        self.record_count = (self.raw_start - 0x60) // 44
+        self.template_records = [
+            self.template[self.header_size + index * self.record_size : self.header_size + (index + 1) * self.record_size]
+            for index in range(self.template_record_count)
+        ]
 
-    def _find_raw_end(self) -> int:
-        cursor = self.raw_start
-        limit = self.elev_offset
-        while cursor + 16 <= limit and self.template[cursor : cursor + 16] != b"\x00" * 16:
-            cursor += 8
-        return cursor
+    def _record_count_for_points(self, point_count: int) -> int:
+        # Each record count is a uint16. Boundary points are shared by adjacent
+        # records, so a segment can contribute at most 0xffff - 1 new points.
+        minimum = max(1, math.ceil((point_count - 1) / 0xFFFE))
+        return max(minimum, min(self.template_record_count, point_count - 1))
 
     def create(self, points: list[TrackPoint], rid: int, name: str) -> bytes:
         if len(points) < 2:
             raise ValueError("ルートには2点以上必要です。")
-        data = bytearray(self.template)
-        route_points = sample_uniform(points, self.elev_count)
-        raw_points = sample_preserving_points(points, len(self.raw_points))
+        # The device accepts variable-length RO files, but the available
+        # reference files show a much smaller practical point budget than a
+        # dense GPX track. Keep the full route shape while staying within the
+        # template's known-compatible elevation sample count.
+        route_points = sample_preserving_points(points, min(len(points), self.template_elev_count))
+        point_count = len(route_points)
+        record_count = self._record_count_for_points(point_count)
+        segments = partition_track_points(route_points, record_count)
+        if record_count > 0xFFFF:
+            raise ValueError("ROの区間レコード数が上限を超えています。")
+
+        record_table = bytearray()
+        coordinate_data = bytearray()
+        point_offset = self.header_size + self.record_size * record_count
+        for index, segment in enumerate(segments):
+            template_record = self.template_records[index % self.template_record_count]
+            record = bytearray(template_record)
+            start = segment[0]
+            end = segment[-1]
+            self._write_point(record, 0, start)
+            self._write_point(record, 8, end)
+            struct.pack_into("<I", record, 16, round(track_distance(segment)))
+            struct.pack_into("<H", record, 22, len(segment))
+            struct.pack_into("<I", record, 24, point_offset)
+            self._write_point(record, 28, TrackPoint(min(start.lat, end.lat), min(start.lon, end.lon)))
+            self._write_point(record, 36, TrackPoint(max(start.lat, end.lat), max(start.lon, end.lon)))
+            record_table.extend(record)
+            for point in segment:
+                coordinate_data.extend(
+                    struct.pack("<ii", round(point.lat * 1_000_000), round(point.lon * 1_000_000))
+                )
+            point_offset += len(segment) * 8
+
+        point_end = point_offset
+        elevation_points = route_points
+        elevation_count = len(elevation_points)
+        elev_marker_offset = point_end + self.elev_gap
+        elev_data_offset = elev_marker_offset + 12
+        elev_data = bytearray(b"ELEV" + struct.pack("<II", elevation_count, 0))
+        previous = elevation_points[0]
+        for index, point in enumerate(elevation_points):
+            altitude = int(point.ele) if point.ele is not None else 0
+            delta = round(haversine_m(previous, point)) if index else 0
+            elev_data.extend(struct.pack("<II", max(0, altitude), max(0, delta)))
+            previous = point
+
+        data = bytearray(self.template[: self.header_size])
         total_m = track_distance(points)
         gain_m = elevation_gain(points)
 
         struct.pack_into("<I", data, 0x08, rid)
-        struct.pack_into("<I", data, 0x10, len(data))
-        struct.pack_into("<I", data, 0x1C, self.elev_count)
+        struct.pack_into("<I", data, 0x14, 2 | (record_count << 16))
+        struct.pack_into("<I", data, 0x18, elev_data_offset)
+        struct.pack_into("<I", data, 0x1C, elevation_count)
+        struct.pack_into("<I", data, 0x30, point_end)
         lats = [p.lat for p in points]
         lons = [p.lon for p in points]
         struct.pack_into(
@@ -334,48 +439,15 @@ class XossRouteWriter:
         struct.pack_into("<I", data, 0x34, gain_m)
         struct.pack_into("<I", data, 0x38, round(total_m))
         data[0x40:0x60] = b"\x00" * 32
-        name_bytes = name.encode("utf-8")
-        while len(name_bytes) > 31:
-            name_bytes = name_bytes[:-1]
-            try:
-                name_bytes.decode("utf-8")
-                break
-            except UnicodeDecodeError:
-                continue
+        name_bytes = truncate_utf8(name, 31).encode("utf-8")
         data[0x40 : 0x40 + len(name_bytes)] = name_bytes
 
-        # The first part is a fixed-size table of route segments. Keep its
-        # instruction type but move each segment onto the new route.
-        for index in range(self.record_count):
-            offset = 0x60 + index * 44
-            old_start = self._read_point(self.template, offset)
-            old_end = self._read_point(self.template, offset + 8)
-            start_fraction = self._nearest_fraction(old_start)
-            end_fraction = self._nearest_fraction(old_end)
-            new_start = sample_by_fraction(points, [start_fraction])[0]
-            new_end = sample_by_fraction(points, [end_fraction])[0]
-            self._write_point(data, offset, new_start)
-            self._write_point(data, offset + 8, new_end)
-            struct.pack_into("<I", data, offset + 16, round(haversine_m(new_start, new_end)))
-            old_count = struct.unpack_from("<H", self.template, offset + 22)[0]
-            if old_count > 0:
-                new_count = max(2, round(old_count * max(0.01, end_fraction - start_fraction) * self.elev_count))
-                struct.pack_into("<H", data, offset + 22, min(0xFFFF, new_count))
-            self._write_point(data, offset + 28, TrackPoint(new_start.lat, new_end.lon))
-            self._write_point(data, offset + 36, TrackPoint(new_end.lat, new_start.lon))
-
-        for index, point in enumerate(raw_points):
-            self._write_point(data, self.raw_start + index * 8, point)
-
-        # ELEV stores integer elevation and distance since the previous point.
-        elev_offset = self.elev_offset + 12
-        previous = route_points[0]
-        for point in route_points:
-            altitude = int(point.ele) if point.ele is not None else 0
-            delta = round(haversine_m(previous, point)) if point is not route_points[0] else 0
-            struct.pack_into("<II", data, elev_offset, max(0, altitude), max(0, delta))
-            elev_offset += 8
-            previous = point
+        data.extend(record_table)
+        data.extend(coordinate_data)
+        data.extend(b"\x00" * self.elev_gap)
+        data.extend(elev_data)
+        data.extend(b"\x00\x00")
+        struct.pack_into("<I", data, 0x10, len(data))
 
         # The final two bytes are the little-endian CRC-16/Modbus of the file.
         struct.pack_into("<H", data, len(data) - 2, crc16_modbus(bytes(data[:-2])))
@@ -389,14 +461,6 @@ class XossRouteWriter:
     @staticmethod
     def _write_point(data: bytearray, offset: int, point: TrackPoint) -> None:
         struct.pack_into("<ii", data, offset, round(point.lat * 1_000_000), round(point.lon * 1_000_000))
-
-    def _nearest_fraction(self, point: TrackPoint) -> float:
-        best_index = min(
-            range(len(self.raw_points)),
-            key=lambda i: (self.raw_points[i].lat - point.lat) ** 2 + (self.raw_points[i].lon - point.lon) ** 2,
-        )
-        return self.raw_fractions[best_index]
-
 
 class MapPreview(ttk.Frame):
     """A lightweight OSM tile view with a GPX route drawn above it."""
@@ -421,10 +485,16 @@ class MapPreview(ttk.Frame):
         self.canvas.grid(row=1, column=0, sticky="nsew")
         self.canvas.bind("<Configure>", self._on_resize)
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Button-4>", lambda event: self._on_mousewheel(event, 1))
+        self.canvas.bind("<Button-5>", lambda event: self._on_mousewheel(event, -1))
+        self.canvas.bind("<ButtonPress-1>", self._on_pan_start)
+        self.canvas.bind("<B1-Motion>", self._on_pan_motion)
+        self.canvas.bind("<ButtonRelease-1>", self._on_pan_end)
 
         self.points: list[TrackPoint] = []
         self.zoom = MAP_MIN_ZOOM
         self.center_world = (0.0, 0.0)
+        self._pan_last: tuple[int, int] | None = None
         self._fit_after_id: str | None = None
         self._tile_requests: queue.Queue[tuple[int, int, int]] = queue.Queue()
         self._tile_results: queue.Queue[tuple[tuple[int, int, int], bool]] = queue.Queue()
@@ -467,19 +537,51 @@ class MapPreview(ttk.Frame):
         self._fit_after_id = None
         self.fit_route()
 
-    def change_zoom(self, delta: int) -> None:
+    def change_zoom(self, delta: int, focus_x: float | None = None, focus_y: float | None = None) -> None:
         if not self.points:
             return
         new_zoom = max(MAP_MIN_ZOOM, min(MAP_MAX_ZOOM, self.zoom + delta))
         if new_zoom == self.zoom:
             return
-        ratio = 2 ** (new_zoom - self.zoom)
-        self.center_world = (self.center_world[0] * ratio, self.center_world[1] * ratio)
+        self.center_world = zoomed_center(
+            self.center_world,
+            self.zoom,
+            new_zoom,
+            self.canvas.winfo_width(),
+            self.canvas.winfo_height(),
+            focus_x,
+            focus_y,
+        )
         self.zoom = new_zoom
         self._render()
 
-    def _on_mousewheel(self, event: tk.Event) -> None:
-        self.change_zoom(1 if event.delta > 0 else -1)
+    def _on_mousewheel(self, event: tk.Event, direction: int | None = None) -> str:
+        if direction is None:
+            direction = 1 if event.delta > 0 else -1 if event.delta < 0 else 0
+        if direction:
+            self.change_zoom(direction, event.x, event.y)
+        return "break"
+
+    def _on_pan_start(self, event: tk.Event) -> None:
+        if not self.points:
+            return
+        self._pan_last = (event.x, event.y)
+        self.canvas.configure(cursor="fleur")
+
+    def _on_pan_motion(self, event: tk.Event) -> None:
+        if self._pan_last is None:
+            return
+        last_x, last_y = self._pan_last
+        self.center_world = (
+            self.center_world[0] - (event.x - last_x),
+            self.center_world[1] - (event.y - last_y),
+        )
+        self._pan_last = (event.x, event.y)
+        self._render()
+
+    def _on_pan_end(self, _event: tk.Event) -> None:
+        self._pan_last = None
+        self.canvas.configure(cursor="")
 
     def _on_resize(self, _event: tk.Event) -> None:
         if self.points:
@@ -623,13 +725,56 @@ class MapPreview(ttk.Frame):
 
 def make_rid(existing: set[int]) -> int:
     for _ in range(1000):
-        rid = random.randint(100000, 999999)
+        rid = random.randint(RID_MIN, RID_MAX)
         if rid not in existing:
             return rid
-    rid = int(time.time()) % 900000 + 100000
+    rid = int(time.time()) % (RID_MAX - RID_MIN + 1) + RID_MIN
     while rid in existing:
-        rid = rid + 1 if rid < 999999 else 100000
+        rid = rid + 1 if rid < RID_MAX else RID_MIN
     return rid
+
+
+def make_rids(existing: set[int], count: int) -> list[int]:
+    """Return a collision-free consecutive RID block for split routes."""
+    if count < 1:
+        return []
+    if count > RID_MAX - RID_MIN + 1:
+        raise ValueError("分割ルート数がRIDの上限を超えています。")
+
+    latest_start = RID_MAX - count + 1
+    for _ in range(1000):
+        start = random.randint(RID_MIN, latest_start)
+        candidate = range(start, start + count)
+        if all(rid not in existing for rid in candidate):
+            return list(candidate)
+
+    # Fall back to a deterministic scan if the RID space becomes crowded.
+    start = RID_MIN
+    while start <= latest_start:
+        candidate = range(start, start + count)
+        if all(rid not in existing for rid in candidate):
+            return list(candidate)
+        start += 1
+    raise ValueError("使用可能な連番RIDを確保できませんでした。")
+
+
+def truncate_utf8(text: str, max_bytes: int) -> str:
+    encoded = text.encode("utf-8")[:max_bytes]
+    while encoded:
+        try:
+            return encoded.decode("utf-8")
+        except UnicodeDecodeError:
+            encoded = encoded[:-1]
+    return ""
+
+
+def route_part_name(title: str, part_number: int, part_total: int) -> str:
+    if part_total <= 1:
+        return title
+    width = max(2, len(str(part_total)))
+    suffix = f" {part_number:0{width}d}"
+    title_part = truncate_utf8(title, 31 - len(suffix.encode("utf-8")))
+    return title_part + suffix
 
 
 def read_routebooks(path: Path) -> dict:
@@ -742,10 +887,10 @@ def stage_routes(
     existing = {int(item.get("rid")) for item in routebooks.get("routes", []) if str(item.get("rid", "")).isdigit()}
     generated: list[Path] = []
     new_entries: list[dict] = []
-    for part in parts:
-        rid = make_rid(existing)
+    rids = make_rids(existing, len(parts))
+    for part, rid in zip(parts, rids):
         existing.add(rid)
-        part_name = title if len(parts) == 1 else f"{title} {part.number}"
+        part_name = route_part_name(title, part.number, len(parts))
         payload = writer.create(part.points, rid, part_name)
         output = routes_dir / f"{rid}.ro"
         output.write_bytes(payload)
@@ -842,11 +987,21 @@ class App(tk.Tk):
         self.title_var = tk.StringVar()
         ttk.Entry(root, textvariable=self.title_var).grid(row=1, column=1, columnspan=2, sticky="ew", pady=5)
 
-        ttk.Label(root, text="1ルートあたりの上限距離").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=5)
+        ttk.Label(root, text="距離による分割").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=5)
+        self.split_enabled_var = tk.BooleanVar(value=True)
         self.split_var = tk.StringVar(value=str(DEFAULT_SPLIT_KM))
-        split_entry = ttk.Entry(root, textvariable=self.split_var, width=12)
-        split_entry.grid(row=2, column=1, sticky="w", pady=5)
-        ttk.Label(root, text="km（300km超のルートは自動分割）").grid(row=2, column=2, sticky="w", padx=(10, 0), pady=5)
+        split_options = ttk.Frame(root)
+        split_options.grid(row=2, column=1, columnspan=2, sticky="w", pady=5)
+        self.split_check = ttk.Checkbutton(
+            split_options,
+            text="分割する",
+            variable=self.split_enabled_var,
+            command=self._on_split_toggle,
+        )
+        self.split_check.pack(side="left")
+        self.split_entry = ttk.Entry(split_options, textvariable=self.split_var, width=12)
+        self.split_entry.pack(side="left", padx=(10, 4))
+        ttk.Label(split_options, text="km（上限距離）").pack(side="left")
         self.split_var.trace_add("write", lambda *_: self.update_preview())
 
         ttk.Label(root, text="転送先").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=5)
@@ -931,10 +1086,25 @@ class App(tk.Tk):
         self.log(f"読込完了: {len(self.points):,}点、全長 {track_distance(self.points) / 1000:.1f}km")
         self.update_preview()
 
+    def _on_split_toggle(self) -> None:
+        self.split_entry.configure(state="normal" if self.split_enabled_var.get() else "disabled")
+        self.update_preview()
+
     def update_preview(self) -> None:
         for item in self.tree.get_children():
             self.tree.delete(item)
         if not self.points:
+            return
+        if not self.split_enabled_var.get():
+            self.parts = split_track(self.points, None)
+            total = track_distance(self.points)
+            self.summary_label.configure(text=f"全長 {total / 1000:.2f}km ／ 分割なし（1ルート）")
+            part = self.parts[0]
+            self.tree.insert(
+                "",
+                "end",
+                values=(part.number, f"{part.distance_m / 1000:.2f} km", f"{len(part.points):,}", f"{part.gain_m:,} m"),
+            )
             return
         try:
             max_km = float(self.split_var.get().replace(",", "."))
