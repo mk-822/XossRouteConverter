@@ -1,6 +1,6 @@
 # XOSS NAV+ ルート転送ツール
 
-**ベータ版: 0.1.0-beta.1**
+**ベータ版: 0.1.0-beta.2**
 
 GPXを読み込み、XOSS NAV+用の `routebooks.json` と `Routes\*.ro` を作成して、USBマスストレージへ転送するWindows向けGUIツールです。
 
@@ -24,7 +24,7 @@ GPXを読み込み、XOSS NAV+用の `routebooks.json` と `Routes\*.ro` を作�
 ## 配布版の起動
 
 1. 配布ZIPを展開します。
-2. `XOSS_NAV_Route_Converter-v0.1.0-beta.1.exe` を起動します。
+2. `XOSS_NAV_Route_Converter-v0.1.0-beta.2.exe` を起動します。
 3. GPXを選択し、内容を確認してから保存またはXOSS NAV+への転送を行います。
 
 配布版はPython不要の単体EXEです。Windowsのセキュリティ警告が表示された場合は、配布元とファイルのハッシュ値を確認したうえで判断してください。
@@ -44,7 +44,7 @@ python -m pip install pyinstaller
 build_exe.bat
 ```
 
-`VERSION` の内容を使って、`dist\XOSS_NAV_Route_Converter-v0.1.0-beta.1.exe` が生成されます。
+`VERSION` の内容を使って、`dist\XOSS_NAV_Route_Converter-v0.1.0-beta.2.exe` が生成されます。
 
 ## 使い方
 
