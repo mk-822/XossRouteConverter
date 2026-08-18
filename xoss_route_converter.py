@@ -9,6 +9,7 @@ import random
 import shutil
 import string
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -25,6 +26,7 @@ import xml.etree.ElementTree as ET
 APP_DIR = Path(__file__).resolve().parent
 VERSION_PATH = APP_DIR / "VERSION"
 TEMPLATE_PATH = APP_DIR / "assets" / "xoss_nav_template.ro"
+SETTINGS_FILENAME = "settings.json"
 DEFAULT_SPLIT_KM = 300.0
 MIN_OUTPUT_POINTS = 1_000
 MAX_OUTPUT_POINTS = 24_000
@@ -61,6 +63,31 @@ def read_app_version() -> str:
 APP_VERSION = read_app_version()
 
 
+def runtime_directory() -> Path:
+    """Return the directory beside the script or packaged executable."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return APP_DIR
+
+
+def read_window_settings(path: Path) -> dict:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return document if isinstance(document, dict) else {}
+
+
+def write_window_settings(path: Path, geometry: str, split_mode: str) -> None:
+    document = {
+        "geometry": geometry,
+        "split_mode": split_mode,
+    }
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
 @dataclass
 class TrackPoint:
     lat: float
@@ -69,11 +96,22 @@ class TrackPoint:
 
 
 @dataclass
+class GpxWaypoint:
+    name: str
+    lat: float
+    lon: float
+    comment: str = ""
+    description: str = ""
+    waypoint_type: str = ""
+
+
+@dataclass
 class RoutePart:
     number: int
     points: list[TrackPoint]
     distance_m: float
     gain_m: int
+    label: str = ""
 
 
 def haversine_m(a: TrackPoint, b: TrackPoint) -> float:
@@ -112,7 +150,7 @@ def interpolate(a: TrackPoint, b: TrackPoint, ratio: float) -> TrackPoint:
     )
 
 
-def parse_gpx(path: Path) -> tuple[str, list[TrackPoint]]:
+def parse_gpx_with_waypoints(path: Path) -> tuple[str, list[TrackPoint], list[GpxWaypoint]]:
     root = ET.parse(path).getroot()
     track_elements = [element for element in root.iter() if element.tag.endswith("trkpt")]
     point_elements = track_elements or [element for element in root.iter() if element.tag.endswith("rtept")]
@@ -143,7 +181,51 @@ def parse_gpx(path: Path) -> tuple[str, list[TrackPoint]]:
             break
     if not title:
         title = path.stem
+
+    waypoints: list[GpxWaypoint] = []
+    for element in root.iter():
+        if not element.tag.endswith("wpt"):
+            continue
+        try:
+            lat = float(element.attrib["lat"])
+            lon = float(element.attrib["lon"])
+        except (KeyError, ValueError):
+            continue
+        waypoints.append(
+            GpxWaypoint(
+                name=(element.findtext("{*}name") or "").strip(),
+                lat=lat,
+                lon=lon,
+                comment=(element.findtext("{*}cmt") or "").strip(),
+                description=(element.findtext("{*}desc") or "").strip(),
+                waypoint_type=(element.findtext("{*}type") or "").strip(),
+            )
+        )
+    return title, points, waypoints
+
+
+def parse_gpx(path: Path) -> tuple[str, list[TrackPoint]]:
+    """Read a GPX route while preserving the original two-value API."""
+    title, points, _waypoints = parse_gpx_with_waypoints(path)
     return title, points
+
+
+def is_checkpoint_waypoint(waypoint: GpxWaypoint) -> bool:
+    """Recognize controls and named pass-through checkpoints in common GPX exports."""
+    name = waypoint.name.casefold()
+    comment = waypoint.comment.casefold()
+    waypoint_type = waypoint.waypoint_type.casefold()
+    return (
+        waypoint_type == "checkpoint"
+        or comment == "control"
+        or name.startswith("pc")
+        or waypoint.name.startswith("通過")
+    )
+
+
+def checkpoint_waypoints(waypoints: list[GpxWaypoint]) -> list[GpxWaypoint]:
+    """Return PC and pass-through checkpoint candidates, excluding ordinary waypoints."""
+    return [waypoint for waypoint in waypoints if is_checkpoint_waypoint(waypoint)]
 
 
 def split_track(points: list[TrackPoint], max_distance_m: float | None) -> list[RoutePart]:
@@ -190,6 +272,116 @@ def split_track(points: list[TrackPoint], max_distance_m: float | None) -> list[
         RoutePart(i, part, track_distance(part), elevation_gain(part))
         for i, part in enumerate(parts, start=1)
     ]
+
+
+def _project_waypoint_to_segment(
+    waypoint: GpxWaypoint,
+    start: TrackPoint,
+    end: TrackPoint,
+) -> tuple[TrackPoint, float]:
+    """Project a waypoint onto a short route segment using a local flat projection."""
+    reference_lat = math.radians((waypoint.lat + start.lat + end.lat) / 3.0)
+    scale_x = math.cos(reference_lat)
+    start_x = (start.lon - waypoint.lon) * scale_x
+    start_y = start.lat - waypoint.lat
+    end_x = (end.lon - waypoint.lon) * scale_x
+    end_y = end.lat - waypoint.lat
+    delta_x = end_x - start_x
+    delta_y = end_y - start_y
+    denominator = delta_x * delta_x + delta_y * delta_y
+    if denominator <= 0:
+        ratio = 0.0
+    else:
+        ratio = (-(start_x * delta_x) - (start_y * delta_y)) / denominator
+        ratio = max(0.0, min(1.0, ratio))
+    projected = interpolate(start, end, ratio)
+    return projected, haversine_m(projected, TrackPoint(waypoint.lat, waypoint.lon))
+
+
+def _nearest_route_position(
+    points: list[TrackPoint],
+    waypoint: GpxWaypoint,
+) -> tuple[float, TrackPoint, float]:
+    """Return a waypoint's nearest fractional point index, projected point, and error."""
+    best_distance = math.inf
+    best_position = 0.0
+    best_point = points[0]
+    for index, (start, end) in enumerate(zip(points, points[1:])):
+        projected, distance = _project_waypoint_to_segment(waypoint, start, end)
+        if distance < best_distance:
+            best_distance = distance
+            best_position = index + haversine_m(start, projected) / max(haversine_m(start, end), 1e-9)
+            best_point = projected
+    return best_position, best_point, best_distance
+
+
+def _point_at_route_position(points: list[TrackPoint], position: float) -> TrackPoint:
+    if position <= 0:
+        return points[0]
+    if position >= len(points) - 1:
+        return points[-1]
+    index = min(len(points) - 2, max(0, math.floor(position)))
+    return interpolate(points[index], points[index + 1], position - index)
+
+
+def _points_between_route_positions(points: list[TrackPoint], start: float, end: float) -> list[TrackPoint]:
+    """Slice a route between two fractional point indexes, retaining original points."""
+    result = [_point_at_route_position(points, start)]
+    first_original_index = math.floor(start) + 1
+    last_original_index = math.ceil(end)
+    result.extend(points[first_original_index:last_original_index])
+    end_point = _point_at_route_position(points, end)
+    if result[-1] != end_point:
+        result.append(end_point)
+    return result
+
+
+def split_track_at_checkpoints(
+    points: list[TrackPoint],
+    checkpoints: list[GpxWaypoint],
+) -> list[RoutePart]:
+    """Split a route at GPX PC/pass-through waypoints in their route order."""
+    if len(points) < 2:
+        raise ValueError("ルートには2点以上必要です。")
+    if not checkpoints:
+        raise ValueError("GPXにチェックポイント（PCまたは通過チェック）がありません。")
+
+    located: list[tuple[float, GpxWaypoint]] = []
+    for waypoint in checkpoints:
+        position, _projected, _distance = _nearest_route_position(points, waypoint)
+        located.append((position, waypoint))
+    located.sort(key=lambda item: item[0])
+
+    route_end = float(len(points) - 1)
+    boundaries: list[tuple[float, str]] = [(0.0, "START")]
+    for position, waypoint in located:
+        if position <= 1e-7 or position >= route_end - 1e-7:
+            continue
+        if boundaries and abs(position - boundaries[-1][0]) <= 1e-7:
+            continue
+        label = waypoint.name or f"チェックポイント{len(boundaries)}"
+        boundaries.append((position, label))
+    boundaries.append((route_end, "GOAL"))
+
+    parts: list[RoutePart] = []
+    for number, (left, right) in enumerate(zip(boundaries, boundaries[1:]), start=1):
+        start_position, start_label = left
+        end_position, end_label = right
+        segment = _points_between_route_positions(points, start_position, end_position)
+        if len(segment) < 2:
+            continue
+        parts.append(
+            RoutePart(
+                number=len(parts) + 1,
+                points=segment,
+                distance_m=track_distance(segment),
+                gain_m=elevation_gain(segment),
+                label=f"{start_label} → {end_label}",
+            )
+        )
+    if not parts:
+        raise ValueError("有効なチェックポイント区間を作成できませんでした。")
+    return parts
 
 
 def point_distance_fractions(points: list[TrackPoint]) -> list[float]:
@@ -531,6 +723,7 @@ class MapPreview(ttk.Frame):
 
         self.points: list[TrackPoint] = []
         self.route_parts: list[RoutePart] = []
+        self.checkpoints: list[GpxWaypoint] = []
         self.zoom = MAP_MIN_ZOOM
         self.center_world = (0.0, 0.0)
         self._pan_last: tuple[int, int] | None = None
@@ -549,6 +742,11 @@ class MapPreview(ttk.Frame):
             self.set_route_parts([RoutePart(1, list(points), track_distance(points), elevation_gain(points))])
         else:
             self.set_route_parts([])
+
+    def set_checkpoint_waypoints(self, checkpoints: list[GpxWaypoint]) -> None:
+        self.checkpoints = list(checkpoints)
+        if self.points:
+            self._render()
 
     def set_route_parts(self, parts: list[RoutePart]) -> None:
         """Set the route geometry and preserve each split part for colored drawing."""
@@ -753,6 +951,9 @@ class MapPreview(ttk.Frame):
                         self._request_tile(key)
                     loading += 1
 
+        # route_parts is the active split result: distance mode supplies 300 km
+        # parts, checkpoint mode supplies checkpoint parts, and no-split mode
+        # supplies one part, so one color is used in that last case.
         route_parts = self.route_parts or [RoutePart(1, self.points, track_distance(self.points), elevation_gain(self.points))]
         total_route_points = sum(len(part.points) for part in route_parts)
         for part_index, part in enumerate(route_parts):
@@ -778,6 +979,17 @@ class MapPreview(ttk.Frame):
         end_x, end_y = web_mercator_pixel(self.points[-1], self.zoom)
         self._draw_marker(start_x - left, start_y - top, "#2f9e62", "START")
         self._draw_marker(end_x - left, end_y - top, "#c43d4b", "GOAL")
+        for checkpoint in self.checkpoints:
+            checkpoint_x, checkpoint_y = web_mercator_pixel(
+                TrackPoint(checkpoint.lat, checkpoint.lon),
+                self.zoom,
+            )
+            self._draw_marker(
+                checkpoint_x - left,
+                checkpoint_y - top,
+                "#8e5bd9",
+                checkpoint.name or "CHECKPOINT",
+            )
 
         if self._failed_tiles:
             self.status_label.configure(text="背景地図を取得できないため、ルート線のみ表示中")
@@ -990,15 +1202,25 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"XOSS NAV+ ルート転送ツール ({APP_VERSION})")
-        self.geometry("1400x820")
+        self.settings_path = runtime_directory() / SETTINGS_FILENAME
+        self.window_settings = read_window_settings(self.settings_path)
+        saved_geometry = self.window_settings.get("geometry")
+        try:
+            self.geometry(saved_geometry if isinstance(saved_geometry, str) and saved_geometry else "1400x820")
+        except tk.TclError:
+            self.geometry("1400x820")
         self.minsize(1100, 650)
         self.gpx_path: Path | None = None
         self.gpx_title = ""
         self.points: list[TrackPoint] = []
+        self.checkpoints: list[GpxWaypoint] = []
         self.parts: list[RoutePart] = []
         self.drives: list[Path] = []
         self.staging: Path | None = None
+        self._settings_save_after_id: str | None = None
         self._build_ui()
+        self.bind("<Configure>", self._on_window_configure, add="+")
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.refresh_drives()
 
     def _build_ui(self) -> None:
@@ -1009,7 +1231,7 @@ class App(tk.Tk):
             pass
         root = ttk.Frame(self, padding=16)
         root.pack(fill="both", expand=True)
-        root.columnconfigure(0, weight=0, minsize=500)
+        root.columnconfigure(0, weight=0, minsize=460)
         root.columnconfigure(1, weight=1, minsize=560)
         root.rowconfigure(0, weight=1)
 
@@ -1036,21 +1258,41 @@ class App(tk.Tk):
         self.title_var = tk.StringVar()
         ttk.Entry(root, textvariable=self.title_var).grid(row=1, column=1, columnspan=2, sticky="ew", pady=5)
 
-        ttk.Label(root, text="距離による分割").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=5)
-        self.split_enabled_var = tk.BooleanVar(value=True)
+        ttk.Label(root, text="分割方式").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=5)
+        saved_split_mode = self.window_settings.get("split_mode")
+        if saved_split_mode not in {"distance", "checkpoint", "none"}:
+            saved_split_mode = "distance"
+        self.split_mode_var = tk.StringVar(value=saved_split_mode)
         self.split_var = tk.StringVar(value=str(DEFAULT_SPLIT_KM))
         split_options = ttk.Frame(root)
         split_options.grid(row=2, column=1, columnspan=2, sticky="w", pady=5)
-        self.split_check = ttk.Checkbutton(
+        distance_options = ttk.Frame(split_options)
+        distance_options.pack(side="left")
+        ttk.Radiobutton(
+            distance_options,
+            text="距離で分割",
+            variable=self.split_mode_var,
+            value="distance",
+            command=self._on_split_mode_change,
+        ).pack(side="left")
+        self.split_entry = ttk.Entry(distance_options, textvariable=self.split_var, width=12)
+        self.split_entry.pack(side="left", padx=(8, 4))
+        self.split_distance_label = ttk.Label(distance_options, text="km")
+        self.split_distance_label.pack(side="left")
+        ttk.Radiobutton(
             split_options,
-            text="分割する",
-            variable=self.split_enabled_var,
-            command=self._on_split_toggle,
-        )
-        self.split_check.pack(side="left")
-        self.split_entry = ttk.Entry(split_options, textvariable=self.split_var, width=12)
-        self.split_entry.pack(side="left", padx=(10, 4))
-        ttk.Label(split_options, text="km（上限距離）").pack(side="left")
+            text="チェックポイントで分割",
+            variable=self.split_mode_var,
+            value="checkpoint",
+            command=self._on_split_mode_change,
+        ).pack(side="left", padx=(12, 0))
+        ttk.Radiobutton(
+            split_options,
+            text="分割しない",
+            variable=self.split_mode_var,
+            value="none",
+            command=self._on_split_mode_change,
+        ).pack(side="left", padx=(12, 0))
         self.split_var.trace_add("write", lambda *_: self.update_preview())
 
         ttk.Label(root, text="点数による間引き").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=5)
@@ -1075,15 +1317,26 @@ class App(tk.Tk):
         preview_box.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=(14, 10))
         preview_box.columnconfigure(0, weight=1)
         preview_box.rowconfigure(1, weight=1)
-        self.summary_label = ttk.Label(preview_box, text="GPXを選択すると距離と分割数を表示します。")
+        self.summary_label = ttk.Label(
+            preview_box,
+            text="GPXを選択すると距離と分割数を表示します。",
+            wraplength=440,
+            justify="left",
+        )
         self.summary_label.grid(row=0, column=0, sticky="w", pady=(0, 8))
         columns = ("part", "distance", "points", "gain")
         self.tree = ttk.Treeview(preview_box, columns=columns, show="headings", height=10)
-        headings = {"part": "区間", "distance": "距離", "points": "点数", "gain": "獲得標高"}
-        widths = {"part": 90, "distance": 180, "points": 120, "gain": 160}
+        headings = {"part": "区間 / チェックポイント", "distance": "距離", "points": "点数", "gain": "獲得標高"}
+        widths = {"part": 170, "distance": 130, "points": 110, "gain": 130}
         for column in columns:
             self.tree.heading(column, text=headings[column])
-            self.tree.column(column, width=widths[column], anchor="center")
+            self.tree.column(
+                column,
+                width=widths[column],
+                minwidth=widths[column],
+                anchor="center",
+                stretch=column == "part",
+            )
         scroll = ttk.Scrollbar(preview_box, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.grid(row=1, column=0, sticky="nsew")
@@ -1119,6 +1372,7 @@ class App(tk.Tk):
 
         self.status = tk.Text(root, height=5, state="disabled", wrap="word", background="#f5f5f5")
         self.status.grid(row=8, column=0, columnspan=3, sticky="ew")
+        self._on_split_mode_change()
         self.log("GPXファイルを選択してください。")
 
     def log(self, message: str) -> None:
@@ -1135,20 +1389,54 @@ class App(tk.Tk):
         if not selected:
             return
         try:
-            self.gpx_title, self.points = parse_gpx(Path(selected))
+            self.gpx_title, self.points, waypoints = parse_gpx_with_waypoints(Path(selected))
         except (OSError, ET.ParseError, ValueError) as exc:
             messagebox.showerror("GPX読込エラー", str(exc))
             return
+        self.checkpoints = checkpoint_waypoints(waypoints)
         self.gpx_path = Path(selected)
         self.gpx_label.configure(text=str(self.gpx_path))
         self.title_var.set(self.gpx_title)
         self.map_preview.set_route(self.points)
-        self.log(f"読込完了: {len(self.points):,}点、全長 {track_distance(self.points) / 1000:.1f}km")
+        self.map_preview.set_checkpoint_waypoints(self.checkpoints)
+        self.log(
+            f"読込完了: {len(self.points):,}点、全長 {track_distance(self.points) / 1000:.1f}km、"
+            f"チェックポイント候補 {len(self.checkpoints)}件"
+        )
         self.update_preview()
 
-    def _on_split_toggle(self) -> None:
-        self.split_entry.configure(state="normal" if self.split_enabled_var.get() else "disabled")
+    def _on_split_mode_change(self) -> None:
+        enabled = self.split_mode_var.get() == "distance"
+        self.split_entry.configure(state="normal" if enabled else "disabled")
+        self.split_distance_label.configure(state="normal" if enabled else "disabled")
         self.update_preview()
+        self._save_window_settings()
+
+    def _save_window_settings(self) -> None:
+        self._settings_save_after_id = None
+        try:
+            write_window_settings(self.settings_path, self.geometry(), self.split_mode_var.get())
+        except OSError:
+            pass
+
+    def _on_window_configure(self, event: tk.Event) -> None:
+        if event.widget is not self:
+            return
+        if self._settings_save_after_id is not None:
+            try:
+                self.after_cancel(self._settings_save_after_id)
+            except tk.TclError:
+                pass
+        self._settings_save_after_id = self.after(400, self._save_window_settings)
+
+    def _on_close(self) -> None:
+        if self._settings_save_after_id is not None:
+            try:
+                self.after_cancel(self._settings_save_after_id)
+            except tk.TclError:
+                pass
+        self._save_window_settings()
+        self.destroy()
 
     def _get_point_limit(self) -> int:
         value = self.point_limit_var.get().strip().replace(",", "")
@@ -1162,6 +1450,12 @@ class App(tk.Tk):
             raise ValueError(f"間引き後の点数は{MIN_OUTPUT_POINTS:,}～{MAX_OUTPUT_POINTS:,}の範囲で指定してください。")
         return limit
 
+    def _show_unsplit_route_on_map(self) -> None:
+        """Keep the map in one neutral route color when no valid split is available."""
+        self.parts = []
+        if self.points:
+            self.map_preview.set_route(self.points)
+
     def update_preview(self) -> None:
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -1171,13 +1465,14 @@ class App(tk.Tk):
             max_points = self._get_point_limit()
         except ValueError as exc:
             self.summary_label.configure(text=str(exc))
-            self.parts = []
+            self._show_unsplit_route_on_map()
             return
 
         def output_point_count(part: RoutePart) -> int:
             return min(len(part.points), max_points)
 
-        if not self.split_enabled_var.get():
+        mode = self.split_mode_var.get()
+        if mode == "none":
             self.parts = split_track(self.points, None)
             self.map_preview.set_route_parts(self.parts)
             total = track_distance(self.points)
@@ -1190,6 +1485,36 @@ class App(tk.Tk):
                 values=(part.number, f"{part.distance_m / 1000:.2f} km", f"{output_point_count(part):,}", f"{part.gain_m:,} m"),
             )
             return
+
+        if mode == "checkpoint":
+            try:
+                self.parts = split_track_at_checkpoints(self.points, self.checkpoints)
+            except ValueError as exc:
+                self.summary_label.configure(text=str(exc))
+                self._show_unsplit_route_on_map()
+                return
+            self.map_preview.set_route_parts(self.parts)
+            total = track_distance(self.points)
+            point_limit_text = f" ／ 出力点数上限 {max_points:,}点"
+            self.summary_label.configure(
+                text=(
+                    f"全長 {total / 1000:.2f}km ／ {len(self.parts)}ルートに分割"
+                    f"（チェックポイント {len(self.checkpoints)}件）{point_limit_text}"
+                )
+            )
+            for part in self.parts:
+                self.tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        part.label or part.number,
+                        f"{part.distance_m / 1000:.2f} km",
+                        f"{output_point_count(part):,}",
+                        f"{part.gain_m:,} m",
+                    ),
+                )
+            return
+
         try:
             max_km = float(self.split_var.get().replace(",", "."))
             if max_km <= 0:
@@ -1197,7 +1522,7 @@ class App(tk.Tk):
             self.parts = split_track(self.points, max_km * 1000.0)
         except ValueError:
             self.summary_label.configure(text="分割距離を正の数値で入力してください。")
-            self.parts = []
+            self._show_unsplit_route_on_map()
             return
         self.map_preview.set_route_parts(self.parts)
         total = track_distance(self.points)
@@ -1281,7 +1606,7 @@ class App(tk.Tk):
 
     def make_staging(self) -> Path:
         if not self.parts:
-            raise ValueError("GPX、分割距離、間引き設定を確認してください。")
+            raise ValueError("GPX、分割方式、間引き設定を確認してください。")
         title = self.title_var.get().strip()
         if not title:
             raise ValueError("ルート名を入力してください。")

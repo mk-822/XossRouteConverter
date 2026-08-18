@@ -11,6 +11,52 @@ REFERENCE = ROOT / "ReferenceFiles"
 
 
 class ConverterTests(unittest.TestCase):
+    def test_window_settings_round_trip(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "settings.json"
+            converter.write_window_settings(path, "1280x760+40+50", "checkpoint")
+            self.assertEqual(
+                converter.read_window_settings(path),
+                {"geometry": "1280x760+40+50", "split_mode": "checkpoint"},
+            )
+
+    def test_gpx_waypoints_include_pc_and_pass_through_checkpoints(self):
+        gpx = """<?xml version="1.0" encoding="UTF-8"?>
+<gpx xmlns="http://www.topografix.com/GPX/1/1" version="1.1">
+  <metadata><name>チェックポイントテスト</name></metadata>
+  <wpt lat="35.010" lon="139.000"><name>PC1</name><cmt>control</cmt><type>checkpoint</type></wpt>
+  <wpt lat="35.020" lon="139.000"><name>通過C-A</name><type>overlook</type></wpt>
+  <wpt lat="35.030" lon="139.000"><name>FINISH</name><cmt>stop</cmt><type>generic</type></wpt>
+  <trk><trkseg>
+    <trkpt lat="35.000" lon="139.000" />
+    <trkpt lat="35.010" lon="139.000" />
+    <trkpt lat="35.020" lon="139.000" />
+    <trkpt lat="35.030" lon="139.000" />
+  </trkseg></trk>
+</gpx>
+"""
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "checkpoints.gpx"
+            path.write_text(gpx, encoding="utf-8")
+            title, points, waypoints = converter.parse_gpx_with_waypoints(path)
+
+        self.assertEqual(title, "チェックポイントテスト")
+        self.assertEqual(len(points), 4)
+        self.assertEqual([waypoint.name for waypoint in converter.checkpoint_waypoints(waypoints)], ["PC1", "通過C-A"])
+
+    def test_split_track_at_checkpoints_uses_route_order_and_labels(self):
+        points = [converter.TrackPoint(35.000 + index * 0.010, 139.000) for index in range(5)]
+        checkpoints = [
+            converter.GpxWaypoint("通過C-A", 35.020, 139.000, waypoint_type="overlook"),
+            converter.GpxWaypoint("PC1", 35.010, 139.000, waypoint_type="checkpoint"),
+        ]
+
+        parts = converter.split_track_at_checkpoints(points, checkpoints)
+
+        self.assertEqual([part.label for part in parts], ["START → PC1", "PC1 → 通過C-A", "通過C-A → GOAL"])
+        self.assertEqual(len(parts), 3)
+        self.assertAlmostEqual(sum(part.distance_m for part in parts), converter.track_distance(points), places=5)
+
     def test_reference_gpx_distance_and_split_preview(self):
         title, points = converter.parse_gpx(REFERENCE / "Original" / "倶知安to登別.gpx")
         self.assertEqual(title, "倶知安to登別")
