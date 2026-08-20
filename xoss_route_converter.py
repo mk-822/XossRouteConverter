@@ -16,7 +16,7 @@ import time
 import tkinter as tk
 import urllib.error
 import urllib.request
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -50,6 +50,23 @@ MAP_ROUTE_COLORS = (
 )
 RID_MIN = 100000
 RID_MAX = 999999
+
+# The RO record field at +20 is the instruction/continuation marker.  These
+# values are inferred from the device-originated reference routes.  The
+# distinction between the slight and normal variants is necessarily
+# heuristic because XOSS has not published the RO specification.
+RO_FLAG_SLIGHT_LEFT = 0x01
+RO_FLAG_LEFT = 0x02
+RO_FLAG_SLIGHT_RIGHT = 0x04
+RO_FLAG_RIGHT = 0x05
+RO_FLAG_STRAIGHT = 0x0A
+RO_FLAG_FINISH = 0x11
+
+TURN_WINDOW_M = 100.0
+TURN_DETECTION_ANGLE_DEG = 18.0
+TURN_SHARP_ANGLE_DEG = 60.0
+MIN_TURN_SEPARATION_M = 160.0
+MAX_STRAIGHT_SEGMENT_M = 6_000.0
 
 
 def read_app_version() -> str:
@@ -488,6 +505,139 @@ def partition_track_points(points: list[TrackPoint], segment_count: int) -> list
     return [points[start : end + 1] for start, end in zip(boundaries, boundaries[1:])]
 
 
+def _bearing_degrees(start: TrackPoint, end: TrackPoint) -> float:
+    """Return the initial great-circle bearing from start to end."""
+    lat1, lon1, lat2, lon2 = map(math.radians, (start.lat, start.lon, end.lat, end.lon))
+    x = math.sin(lon2 - lon1) * math.cos(lat2)
+    y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(lon2 - lon1)
+    return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+
+
+def _signed_turn_angle(degrees: float) -> float:
+    """Normalize a bearing difference to a signed left/right angle."""
+    return (degrees + 540.0) % 360.0 - 180.0
+
+
+def _point_at_distance(
+    points: list[TrackPoint],
+    cumulative: list[float],
+    distance_m: float,
+) -> TrackPoint:
+    """Interpolate a route point at a cumulative distance."""
+    if distance_m <= 0:
+        return points[0]
+    if distance_m >= cumulative[-1]:
+        return points[-1]
+    index = max(0, min(len(points) - 2, bisect_right(cumulative, distance_m) - 1))
+    span = cumulative[index + 1] - cumulative[index]
+    if span <= 0:
+        return points[index]
+    return interpolate(points[index], points[index + 1], (distance_m - cumulative[index]) / span)
+
+
+def classify_turn_flag(turn_angle: float | None) -> int:
+    """Map a signed route bend to the inferred RO instruction marker."""
+    if turn_angle is None:
+        return RO_FLAG_FINISH
+    if abs(turn_angle) < TURN_DETECTION_ANGLE_DEG:
+        return RO_FLAG_STRAIGHT
+    if turn_angle < 0:
+        return RO_FLAG_LEFT if abs(turn_angle) >= TURN_SHARP_ANGLE_DEG else RO_FLAG_SLIGHT_LEFT
+    return RO_FLAG_RIGHT if turn_angle >= TURN_SHARP_ANGLE_DEG else RO_FLAG_SLIGHT_RIGHT
+
+
+def _turn_candidates(points: list[TrackPoint]) -> list[tuple[int, int]]:
+    """Return route point indexes and inferred flags for significant bends."""
+    if len(points) < 3:
+        return []
+
+    cumulative = [0.0]
+    for start, end in zip(points, points[1:]):
+        cumulative.append(cumulative[-1] + haversine_m(start, end))
+    total_m = cumulative[-1]
+    if total_m <= TURN_WINDOW_M * 2:
+        return []
+
+    selected: list[tuple[float, float, int]] = []
+    for index, distance_m in enumerate(cumulative):
+        if distance_m < TURN_WINDOW_M or total_m - distance_m < TURN_WINDOW_M:
+            continue
+        before = _point_at_distance(points, cumulative, distance_m - TURN_WINDOW_M)
+        center = _point_at_distance(points, cumulative, distance_m)
+        after = _point_at_distance(points, cumulative, distance_m + TURN_WINDOW_M)
+        if haversine_m(before, center) <= 1.0 or haversine_m(center, after) <= 1.0:
+            continue
+        incoming = _bearing_degrees(before, center)
+        outgoing = _bearing_degrees(center, after)
+        turn_angle = _signed_turn_angle(outgoing - incoming)
+        if abs(turn_angle) < TURN_DETECTION_ANGLE_DEG:
+            continue
+
+        candidate = (distance_m, turn_angle, index)
+        if not selected or distance_m - selected[-1][0] > MIN_TURN_SEPARATION_M:
+            selected.append(candidate)
+        elif abs(turn_angle) > abs(selected[-1][1]):
+            selected[-1] = candidate
+
+    return [(index, classify_turn_flag(turn_angle)) for _distance, turn_angle, index in selected]
+
+
+def infer_route_segments(points: list[TrackPoint]) -> list[tuple[list[TrackPoint], int]]:
+    """Split a route at inferred bends and attach an RO marker to each segment.
+
+    The route itself remains unchanged.  Significant changes in smoothed
+    bearing become left/right markers, while very long uninterrupted stretches
+    receive a straight marker.  The final segment always receives the finish
+    marker required by the reference routes.
+    """
+    if len(points) < 2:
+        raise ValueError("ルートには2点以上必要です。")
+
+    cumulative = [0.0]
+    for start, end in zip(points, points[1:]):
+        cumulative.append(cumulative[-1] + haversine_m(start, end))
+
+    boundaries = [0]
+    flags: list[int] = []
+    current_index = 0
+    last_index = len(points) - 1
+
+    def add_straight_boundaries(end_index: int) -> None:
+        nonlocal current_index
+        while cumulative[end_index] - cumulative[current_index] > MAX_STRAIGHT_SEGMENT_M:
+            target = cumulative[current_index] + MAX_STRAIGHT_SEGMENT_M
+            split_index = bisect_left(cumulative, target, current_index + 1, end_index + 1)
+            if split_index >= end_index:
+                break
+            if split_index <= current_index:
+                split_index = current_index + 1
+            boundaries.append(split_index)
+            flags.append(RO_FLAG_STRAIGHT)
+            current_index = split_index
+
+    for turn_index, turn_flag in _turn_candidates(points):
+        if turn_index <= current_index or turn_index >= last_index:
+            continue
+        add_straight_boundaries(turn_index)
+        if turn_index <= current_index:
+            continue
+        boundaries.append(turn_index)
+        flags.append(turn_flag)
+        current_index = turn_index
+
+    add_straight_boundaries(last_index)
+    boundaries.append(last_index)
+    flags.append(RO_FLAG_FINISH)
+
+    segments: list[tuple[list[TrackPoint], int]] = []
+    for start, end, flag in zip(boundaries, boundaries[1:], flags):
+        if end > start:
+            segments.append((points[start : end + 1], flag))
+    if not segments:
+        raise ValueError("RO区間を作成できませんでした。")
+    return segments
+
+
 def web_mercator_pixel(point: TrackPoint, zoom: int) -> tuple[float, float]:
     """Convert a GPS point to world-pixel coordinates for a slippy map."""
     scale = MAP_TILE_SIZE * (2**zoom)
@@ -589,12 +739,6 @@ class XossRouteWriter:
             for index in range(self.template_record_count)
         ]
 
-    def _record_count_for_points(self, point_count: int) -> int:
-        # Each record count is a uint16. Boundary points are shared by adjacent
-        # records, so a segment can contribute at most 0xffff - 1 new points.
-        minimum = max(1, math.ceil((point_count - 1) / 0xFFFE))
-        return max(minimum, min(self.template_record_count, point_count - 1))
-
     def create(
         self,
         points: list[TrackPoint],
@@ -605,16 +749,15 @@ class XossRouteWriter:
         if len(points) < 2:
             raise ValueError("ルートには2点以上必要です。")
         route_points = limit_route_points(points, max_points)
-        point_count = len(route_points)
-        record_count = self._record_count_for_points(point_count)
-        segments = partition_track_points(route_points, record_count)
+        segments = infer_route_segments(route_points)
+        record_count = len(segments)
         if record_count > 0xFFFF:
             raise ValueError("ROの区間レコード数が上限を超えています。")
 
         record_table = bytearray()
         coordinate_data = bytearray()
         point_offset = self.header_size + self.record_size * record_count
-        for index, segment in enumerate(segments):
+        for index, (segment, turn_flag) in enumerate(segments):
             template_record = self.template_records[index % self.template_record_count]
             record = bytearray(template_record)
             start = segment[0]
@@ -622,6 +765,7 @@ class XossRouteWriter:
             self._write_point(record, 0, start)
             self._write_point(record, 8, end)
             struct.pack_into("<I", record, 16, round(track_distance(segment)))
+            struct.pack_into("<H", record, 20, turn_flag)
             struct.pack_into("<H", record, 22, len(segment))
             struct.pack_into("<I", record, 24, point_offset)
             self._write_point(record, 28, TrackPoint(min(start.lat, end.lat), min(start.lon, end.lon)))

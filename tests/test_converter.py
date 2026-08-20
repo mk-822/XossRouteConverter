@@ -1,4 +1,5 @@
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -92,6 +93,33 @@ class ConverterTests(unittest.TestCase):
             new_center[1] + focus[1] - height / 2,
         )
         self.assertEqual(new_focus_world, (old_focus_world[0] * 2, old_focus_world[1] * 2))
+
+    def test_inferred_ro_flags_follow_route_turns_and_finish(self):
+        def local_point(x_m, y_m):
+            return converter.TrackPoint(
+                35.0 + y_m / 111_000.0,
+                139.0 + x_m / (111_000.0 * math.cos(math.radians(35.0))),
+            )
+
+        points = []
+        points.extend(local_point(0, y) for y in range(0, 501, 50))
+        points.extend(local_point(x, 500) for x in range(50, 501, 50))
+        points.extend(local_point(500, y) for y in range(450, -1, -50))
+        points.extend(local_point(x, 0) for x in range(550, 1_001, 50))
+
+        segments = converter.infer_route_segments(points)
+        flags = [flag for _segment, flag in segments]
+
+        self.assertEqual(flags, [converter.RO_FLAG_RIGHT, converter.RO_FLAG_RIGHT, converter.RO_FLAG_LEFT, converter.RO_FLAG_FINISH])
+        self.assertEqual([len(segment) for segment, _flag in segments], [11, 11, 11, 11])
+
+        payload = converter.XossRouteWriter().create(points, 654321, "推定フラグ")
+        record_count = int.from_bytes(payload[0x16:0x18], "little")
+        output_flags = [
+            int.from_bytes(payload[0x60 + index * 44 + 20 : 0x60 + index * 44 + 22], "little")
+            for index in range(record_count)
+        ]
+        self.assertEqual(output_flags, flags)
 
     def test_ro_output_has_xzroutes_header_and_valid_crc(self):
         _, points = converter.parse_gpx(REFERENCE / "Original" / "ムライチ.gpx")
